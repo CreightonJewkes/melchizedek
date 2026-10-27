@@ -4,6 +4,7 @@ import { openMemoryDatabase } from '../src/db.js';
 import {
   buildFtsQuery,
   searchBM25,
+  searchFuzzy,
   search,
   ftsErrorCounts,
   MAX_QUERY_TERMS,
@@ -96,5 +97,38 @@ describe('keyword query builder (A1)', () => {
     const r = await search(db, { query: "No module named 'httpx'", limit: 5 });
     expect(r.map((x) => x.chunkId)).toContain('sess-live:1');
     expect(await search(db, { query: '🎉', limit: 5 })).toEqual([]);
+  });
+});
+
+describe('fuzzy fallback query (A2)', () => {
+  let db: Database.Database;
+  beforeEach(() => {
+    db = openMemoryDatabase().db;
+    seedSyntheticCorpus(db);
+  });
+  afterEach(() => db.close());
+
+  it('builds quoted prefix terms of 3+ characters joined with OR', () => {
+    expect(buildFtsQuery('fix db middlew', { prefix: true, minChars: 3 })).toBe(
+      '"fix"* OR "middlew"*',
+    );
+  });
+
+  it('never throws on the error strings that broke the old fallback', () => {
+    const before = ftsErrorCounts.syntax;
+    for (const q of ["ModuleNotFoundError: No module named 'httpx'", 'key:value', '"unclosed']) {
+      expect(() => searchFuzzy(db, q, 10)).not.toThrow();
+    }
+    expect(ftsErrorCounts.syntax).toBe(before);
+  });
+
+  it('matches word prefixes with OR semantics', () => {
+    const r = searchFuzzy(db, 'middlew zzzz', 10);
+    expect(r.map((x) => x.chunkId).sort()).toEqual(['sess-copy:0', 'sess-live:0']);
+    expect(r.every((x) => x.matchType === 'fuzzy')).toBe(true);
+  });
+
+  it('returns nothing for terms that are all too short', () => {
+    expect(searchFuzzy(db, 'a b c', 10)).toEqual([]);
   });
 });

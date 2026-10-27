@@ -20,12 +20,17 @@ export const MAX_QUERY_TERMS = 128;
  * test config py in order). Terms with no letter or digit are dropped. Returns '' when
  * nothing searchable remains.
  */
-export function buildFtsQuery(text: string, prefix = false): string {
+export function buildFtsQuery(
+  text: string,
+  opts: { prefix?: boolean; minChars?: number } = {},
+): string {
+  const minChars = opts.minChars ?? 1;
   const terms = text
     .split(/\s+/u)
-    .filter((t) => /[\p{L}\p{N}]/u.test(t))
+    .filter((t) => (t.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= minChars)
     .slice(0, MAX_QUERY_TERMS);
-  return terms.map((t) => `"${t.replace(/"/g, '""')}"${prefix ? '*' : ''}`).join(' OR ');
+  const star = opts.prefix ? '*' : '';
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"${star}`).join(' OR ');
 }
 
 /** Keyword-search failures by cause, since process start (reported by m9k_info). */
@@ -369,15 +374,13 @@ export async function search(
   return finalResults;
 }
 
+/**
+ * Prefix fallback ("fuzzy" here means prefix expansion, not typo correction): each term
+ * of 3+ letters or digits becomes a quoted prefix phrase ("term"*), joined with OR.
+ */
 export function searchFuzzy(db: Database.Database, query: string, limit: number): SearchResult[] {
-  if (!query.trim()) return [];
-
-  // Add wildcards for fuzzy matching: "term" -> "term*"
-  const fuzzyQuery = query
-    .split(/\s+/)
-    .map((term) => `${term}*`)
-    .join(' ');
-
-  const results = searchBM25(db, fuzzyQuery, limit);
+  const expr = buildFtsQuery(query, { prefix: true, minChars: 3 });
+  if (!expr) return [];
+  const results = searchBM25(db, expr, limit);
   return results.map((r) => ({ ...r, matchType: 'fuzzy' as const }));
 }
