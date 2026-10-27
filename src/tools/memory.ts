@@ -18,6 +18,7 @@ import { writeConfigFile } from '../config.js';
 import type { MelchizedekConfig, EmbedJobStatus } from '../models.js';
 import type { ToolContext } from './context.js';
 import { CONV_KIND_MEMORY } from '../constants.js';
+import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 
 // Valid config keys that can be updated via m9k_config
 const CONFIGURABLE_KEYS = new Set([
@@ -77,7 +78,7 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
         ctx.db
           .prepare(
             `INSERT INTO conv_sessions (id, project, jsonl_path, file_hash, file_size, started_at, message_count, chunk_count)
-           VALUES (?, ?, ?, ?, ?, datetime('now'), 0, 0)`,
+           VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 0, 0)`,
           )
           .run(MANUAL_SESSION_ID, '__global__', '__manual__', '', 0);
       }
@@ -90,7 +91,7 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
       const result = ctx.db
         .prepare(
           `INSERT OR IGNORE INTO conv_chunks (id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json)
-         VALUES (?, ?, 0, ?, ?, '', ?, datetime('now'), ?, ?, '{}')`,
+         VALUES (?, ?, 0, ?, ?, '', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, '{}')`,
         )
         .run(
           chunkId,
@@ -124,10 +125,26 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'm9k_sessions',
     {
-      description: 'List all indexed sessions, optionally filtered by project.',
+      description: 'List indexed sessions, optionally filtered by project and/or start date.',
       inputSchema: {
         project: z.string().optional().describe('Filter by project path'),
         limit: z.number().int().min(1).max(100).default(20).describe('Max sessions'),
+        since: z
+          .string()
+          .optional()
+          .describe(
+            "Only sessions starting from this date on: ISO-8601 (local time unless it has an offset) or relative ('yesterday', '3 days ago').",
+          ),
+        until: z
+          .string()
+          .optional()
+          .describe('Only sessions starting before this date (exclusive). Same formats as since.'),
+        timeframe: z
+          .string()
+          .optional()
+          .describe(
+            "Named date range in local time, e.g. 'today', 'yesterday', 'last week', 'this month', 'past 3 days', '2 hours ago' (one hour either side). since/until override its sides.",
+          ),
         source: z
           .enum(['conversations', 'git', 'files'])
           .optional()
@@ -140,12 +157,27 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
         openWorldHint: false,
       },
     },
-    async ({ project, limit }) => {
+    async ({ project, limit, since, until, timeframe }) => {
+      let range;
+      try {
+        range = resolveDateRange({ since, until, timeframe }, ctx.clock?.() ?? new Date());
+      } catch (err) {
+        if (err instanceof DateInputError) return dateErrorResult(err);
+        throw err;
+      }
       let sql = 'SELECT * FROM conv_sessions WHERE deleted_at IS NULL';
       const params: unknown[] = [];
       if (project) {
         sql += ' AND project = ?';
         params.push(project);
+      }
+      if (range.since) {
+        sql += ' AND started_at >= ?';
+        params.push(range.since);
+      }
+      if (range.until) {
+        sql += ' AND started_at < ?';
+        params.push(range.until);
       }
       sql += ' ORDER BY started_at DESC LIMIT ?';
       params.push(limit);

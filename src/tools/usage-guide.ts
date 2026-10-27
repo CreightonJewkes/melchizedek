@@ -56,7 +56,7 @@ Available tools (16):
 - m9k_restart: Restart the MCP server to load fresh code after rebuild
 
 RETRIEVAL PATTERN (use this order):
-1. m9k_search(query) → compact results, current project and session boosted (use order="date_asc" to find first occurrence)
+1. m9k_search(query) → compact results, current project and session boosted (use order="date_asc" to find first occurrence; timeframe="yesterday" / "last week" or since="3 days ago" to filter by date)
 2. m9k_context(chunkId) → surrounding conversation
 3. m9k_full([chunkIds]) → complete content if needed
 

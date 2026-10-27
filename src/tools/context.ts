@@ -20,4 +20,6 @@ export interface ToolContext {
   embeddingState: EmbeddingState;
   version: string;
   mode: 'daemon' | 'local';
+  /** Clock for relative dates ("yesterday"); injectable so replays resolve as asked. */
+  clock?: () => Date;
 }

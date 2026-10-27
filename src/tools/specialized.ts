@@ -6,6 +6,7 @@ import path from 'path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { search } from '../search.js';
+import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 import type { ToolContext } from './context.js';
 
 export function registerSpecializedTools(server: McpServer, ctx: ToolContext): void {
@@ -189,6 +190,22 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       inputSchema: {
         description: z.string().describe('Description of the current task'),
         limit: z.number().int().min(1).max(20).default(5),
+        since: z
+          .string()
+          .optional()
+          .describe(
+            "Only results from this date on: ISO-8601 (local time unless it has an offset) or relative ('yesterday', '3 days ago').",
+          ),
+        until: z
+          .string()
+          .optional()
+          .describe('Only results before this date (exclusive). Same formats as since.'),
+        timeframe: z
+          .string()
+          .optional()
+          .describe(
+            "Named date range in local time, e.g. 'today', 'yesterday', 'last week', 'this month', 'past 3 days', '2 hours ago' (one hour either side). since/until override its sides.",
+          ),
         source: z
           .enum(['conversations', 'git', 'files'])
           .optional()
@@ -201,11 +218,18 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
         openWorldHint: false,
       },
     },
-    async ({ description, limit }) => {
+    async ({ description, limit, since, until, timeframe }) => {
+      let range;
+      try {
+        range = resolveDateRange({ since, until, timeframe }, ctx.clock?.() ?? new Date());
+      } catch (err) {
+        if (err instanceof DateInputError) return dateErrorResult(err);
+        throw err;
+      }
       // Use the same search pipeline as m9k_search
       const results = await search(
         ctx.db,
-        { query: description, limit: limit * 3 },
+        { query: description, limit: limit * 3, since: range.since, until: range.until },
         ctx.searchContext,
       );
 

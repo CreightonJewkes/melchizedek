@@ -26,13 +26,17 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           .string()
           .optional()
           .describe(
-            'ISO-8601 date (local time unless it has an offset). Only results from then on.',
+            "Only results from this date on: ISO-8601 (local time unless it has an offset) or relative ('yesterday', '3 days ago').",
           ),
         until: z
           .string()
           .optional()
+          .describe('Only results before this date (exclusive). Same formats as since.'),
+        timeframe: z
+          .string()
+          .optional()
           .describe(
-            'ISO-8601 date (local time unless it has an offset). Only results before it (exclusive).',
+            "Named date range in local time, e.g. 'today', 'yesterday', 'last week', 'this month', 'past 3 days', '2 hours ago' (one hour either side). since/until override its sides.",
           ),
         order: z
           .enum(['score', 'date_asc', 'date_desc'])
@@ -52,10 +56,10 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
         openWorldHint: false,
       },
     },
-    async ({ query, project, limit, since, until, order }) => {
+    async ({ query, project, limit, since, until, timeframe, order }) => {
       let range;
       try {
-        range = resolveDateRange({ since, until });
+        range = resolveDateRange({ since, until, timeframe }, ctx.clock?.() ?? new Date());
       } catch (err) {
         if (err instanceof DateInputError) return dateErrorResult(err);
         throw err;

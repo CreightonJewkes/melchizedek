@@ -28,11 +28,15 @@ import type { ToolContext } from '../src/tools/context.js';
 interface Query {
   id: string;
   query: string;
+  /** When a logged query was asked; relative dates resolve against it. */
+  asked_at?: string;
+  timeframe?: string | null;
   opts: {
     since?: string;
     until?: string;
     project?: string;
     order?: 'score' | 'date_asc' | 'date_desc';
+    asked_at?: string;
   };
 }
 
@@ -135,7 +139,12 @@ async function main(): Promise<void> {
     // recorded as that query's tool error (empty result), as the tool would return it.
     let o: Query['opts'];
     try {
-      o = { ...q.opts, ...resolveDateRange({ since: q.opts.since, until: q.opts.until }) };
+      const askedAt = q.asked_at ?? q.opts.asked_at;
+      const range = resolveDateRange(
+        { since: q.opts.since, until: q.opts.until, timeframe: q.timeframe ?? undefined },
+        askedAt ? new Date(askedAt) : new Date(),
+      );
+      o = { project: q.opts.project, order: q.opts.order, ...range };
     } catch (err) {
       out.write(
         JSON.stringify({
