@@ -285,13 +285,7 @@ export function insertVector(
   embedding: Float32Array,
   suffix = '_text',
 ): void {
-  const vecRowid = db
-    .prepare(`INSERT INTO conv_vec${suffix} (embedding) VALUES (?)`)
-    .run(Buffer.from(embedding.buffer)).lastInsertRowid;
-  db.prepare(`INSERT OR IGNORE INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`).run(
-    vecRowid,
-    chunkId,
-  );
+  insertVectorsBatchToTable(db, [{ chunkId, embedding }], suffix);
 }
 
 export function insertVectorsBatch(
@@ -300,6 +294,43 @@ export function insertVectorsBatch(
   suffix = '_text',
 ): void {
   insertVectorsBatchToTable(db, items, suffix);
+}
+
+/**
+ * Publish freshly computed vectors, safely against concurrent writers.
+ *
+ * Inference runs outside any transaction, so by the time a batch is ready a hook may
+ * have rewritten or deleted some of its chunks. In one short transaction each item is
+ * rechecked: the chunk must still exist, be undeleted and carry the hash it was read
+ * with, and must not already have a vector in this generation. Stale or duplicate items
+ * are discarded (the next pass re-reads them), so no wrong vector is attached and no
+ * vec0 row leaks. Returns the number of vectors actually committed.
+ */
+export function publishVectors(
+  db: Database.Database,
+  items: Array<{ chunkId: string; hash: string; embedding: Float32Array }>,
+  suffix = '_text',
+): number {
+  if (items.length === 0) return 0;
+  const current = db.prepare('SELECT hash FROM conv_chunks WHERE id = ? AND deleted_at IS NULL');
+  const mapped = db.prepare(`SELECT 1 FROM conv_vec_map${suffix} WHERE chunk_id = ?`);
+  const insVec = db.prepare(`INSERT INTO conv_vec${suffix} (embedding) VALUES (?)`);
+  const insMap = db.prepare(
+    `INSERT INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`,
+  );
+  return db
+    .transaction(() => {
+      let published = 0;
+      for (const { chunkId, hash, embedding } of items) {
+        const row = current.get(chunkId) as { hash: string } | undefined;
+        if (!row || row.hash !== hash || mapped.get(chunkId)) continue;
+        const vecRowid = insVec.run(Buffer.from(embedding.buffer)).lastInsertRowid;
+        insMap.run(vecRowid, chunkId);
+        published++;
+      }
+      return published;
+    })
+    .immediate();
 }
 
 // --- Deletion: the one path every caller uses ---
@@ -438,16 +469,16 @@ export function drainPendingVecCleanup(db: Database.Database): number {
  * Minimum content length for embedding. Chunks shorter than this produce
  * noisy vectors that pollute search results at scale.
  */
-const MIN_EMBED_CONTENT_LENGTH = 50;
+export const MIN_EMBED_CONTENT_LENGTH = 50;
 
 export function getChunksWithoutEmbeddings(
   db: Database.Database,
   limit = 100,
   suffix = '_text',
-): Array<{ id: string; content: string }> {
+): Array<{ id: string; content: string; hash: string }> {
   return db
     .prepare(
-      `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content
+      `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash
        FROM conv_chunks c
        LEFT JOIN conv_vec_map${suffix} m ON c.id = m.chunk_id
        WHERE m.chunk_id IS NULL
@@ -456,7 +487,7 @@ export function getChunksWithoutEmbeddings(
        ORDER BY c.timestamp DESC
        LIMIT ?`,
     )
-    .all(MIN_EMBED_CONTENT_LENGTH, limit) as Array<{ id: string; content: string }>;
+    .all(MIN_EMBED_CONTENT_LENGTH, limit) as Array<{ id: string; content: string; hash: string }>;
 }
 
 export function countEligibleChunks(db: Database.Database): number {
@@ -542,18 +573,21 @@ export function createVecTables(db: Database.Database, dimensions: number, suffi
   `);
 }
 
+/** Insert vectors without a content check (tests, tools). Never leaks: mapped chunks are skipped. */
 export function insertVectorsBatchToTable(
   db: Database.Database,
   items: Array<{ chunkId: string; embedding: Float32Array }>,
   suffix = '',
 ): void {
+  const mapped = db.prepare(`SELECT 1 FROM conv_vec_map${suffix} WHERE chunk_id = ?`);
   const insertVec = db.prepare(`INSERT INTO conv_vec${suffix} (embedding) VALUES (?)`);
   const insertMap = db.prepare(
-    `INSERT OR IGNORE INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`,
+    `INSERT INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`,
   );
 
   const transaction = db.transaction(() => {
     for (const { chunkId, embedding } of items) {
+      if (mapped.get(chunkId)) continue;
       const vecRowid = insertVec.run(Buffer.from(embedding.buffer)).lastInsertRowid;
       insertMap.run(vecRowid, chunkId);
     }

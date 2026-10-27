@@ -18,8 +18,9 @@ import {
   deleteChunksWhere,
   deleteSessionsWhere,
   getChunksWithoutEmbeddings,
-  insertVectorsBatch,
   isProjectIgnored,
+  MIN_EMBED_CONTENT_LENGTH,
+  publishVectors,
 } from './db.js';
 import { logger } from './logger.js';
 import { CONV_KIND_EXCHANGE } from './constants.js';
@@ -396,16 +397,26 @@ export async function embedChunks(
         `SELECT COUNT(*) AS cnt FROM conv_chunks c
          LEFT JOIN conv_vec_map${suffix} m ON c.id = m.chunk_id
          WHERE m.chunk_id IS NULL
-           AND LENGTH(c.user_content) + LENGTH(c.assistant_content) >= 50`,
+           AND c.deleted_at IS NULL
+           AND LENGTH(c.user_content) + LENGTH(c.assistant_content) >= ?`,
       )
-      .get() as { cnt: number }
+      .get(MIN_EMBED_CONTENT_LENGTH) as { cnt: number }
   ).cnt;
 
   // Process first batch
   let missing = firstBatch;
+  let previousIds = '';
 
   while (missing.length > 0) {
     if (signal?.aborted) break;
+
+    // A batch whose every item went stale is re-read with fresh content; stop if the
+    // same rows come back unchanged instead of spinning on them.
+    const ids = missing.map((c) => `${c.id}:${c.hash}`).join(',');
+    if (ids === previousIds) {
+      logger.warn('indexer', `embedChunks${suffix}: no progress on the same batch, stopping`);
+      break;
+    }
 
     const texts = missing.map((c) => c.content);
     const lengths = texts.map((t) => t.length);
@@ -433,11 +444,14 @@ export async function embedChunks(
 
     const items = missing.map((c, i) => ({
       chunkId: c.id,
+      hash: c.hash,
       embedding: embeddings[i],
     }));
 
-    insertVectorsBatch(db, items, suffix);
-    done += items.length;
+    // Only committed vectors count; stale items are re-read on the next pass.
+    const published = publishVectors(db, items, suffix);
+    done += published;
+    previousIds = published === 0 ? ids : '';
 
     onProgress?.(done, totalEligible);
 

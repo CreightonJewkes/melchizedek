@@ -7,7 +7,14 @@
 
 import type Database from 'better-sqlite3';
 import type { Embedder } from './models.js';
-import { getMeta, setMeta, deleteMeta, createVecTables, insertVectorsBatchToTable } from './db.js';
+import {
+  getMeta,
+  setMeta,
+  deleteMeta,
+  createVecTables,
+  publishVectors,
+  MIN_EMBED_CONTENT_LENGTH,
+} from './db.js';
 import { logger } from './logger.js';
 
 const P = 'migration';
@@ -96,8 +103,6 @@ export function releaseMigrationLock(db: Database.Database, suffix = '_text'): v
 
 // --- Migration engine ---
 
-const MIN_EMBED_CONTENT_LENGTH = 50;
-
 export class EmbeddingMigration {
   private db: Database.Database;
   private embedder: Embedder;
@@ -185,7 +190,9 @@ export class EmbeddingMigration {
   }
 
   /** Embed a single batch into _next tables */
-  async reembedBatch(batch?: Array<{ id: string; content: string }>): Promise<number> {
+  async reembedBatch(
+    batch?: Array<{ id: string; content: string; hash: string }>,
+  ): Promise<number> {
     const items = batch ?? this.getNextBatch();
     if (items.length === 0) return 0;
 
@@ -202,11 +209,12 @@ export class EmbeddingMigration {
 
     const vectorItems = items.map((c, i) => ({
       chunkId: c.id,
+      hash: c.hash,
       embedding: embeddings[i],
     }));
 
-    insertVectorsBatchToTable(this.db, vectorItems, `${this.suffix}_next`);
-    return items.length;
+    // Stale items (changed or deleted during inference) are discarded and re-read.
+    return publishVectors(this.db, vectorItems, `${this.suffix}_next`);
   }
 
   /** Phase 3: Atomic swap — drop old, rename _next, update meta */
@@ -350,10 +358,10 @@ export class EmbeddingMigration {
   }
 
   /** Get next batch of chunks not yet in _next tables */
-  private getNextBatch(): Array<{ id: string; content: string }> {
+  private getNextBatch(): Array<{ id: string; content: string; hash: string }> {
     return this.db
       .prepare(
-        `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content
+        `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash
          FROM conv_chunks c
          LEFT JOIN conv_vec_map${this.suffix}_next m ON c.id = m.chunk_id
          WHERE m.chunk_id IS NULL
@@ -365,6 +373,7 @@ export class EmbeddingMigration {
       .all(MIN_EMBED_CONTENT_LENGTH, this.batchSize) as Array<{
       id: string;
       content: string;
+      hash: string;
     }>;
   }
 }
