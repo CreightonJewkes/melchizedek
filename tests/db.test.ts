@@ -19,6 +19,7 @@ import {
   unignoreProject,
   getIgnoredProjects,
   purgeProjectData,
+  SCHEMA_VERSION,
 } from '../src/db.js';
 import { CONV_KIND_EXCHANGE } from '../src/constants.js';
 import type Database from 'better-sqlite3';
@@ -209,10 +210,10 @@ describe('db', () => {
       expect(tables.map((t) => t.name)).toContain('stats');
     });
 
-    it('should have user_version = 2', () => {
+    it('should have user_version = SCHEMA_VERSION', () => {
       const version = (db.pragma('user_version') as Array<{ user_version: number }>)[0]
         .user_version;
-      expect(version).toBe(2);
+      expect(version).toBe(SCHEMA_VERSION);
     });
 
     it('getStat should return null for non-existent key', () => {
@@ -364,10 +365,10 @@ describe('db', () => {
       expect(tables.map((t) => t.name)).toContain('meta');
     });
 
-    it('should have user_version = 2', () => {
+    it('should have user_version = SCHEMA_VERSION', () => {
       const version = (db.pragma('user_version') as Array<{ user_version: number }>)[0]
         .user_version;
-      expect(version).toBe(2);
+      expect(version).toBe(SCHEMA_VERSION);
     });
 
     it('getMeta should return null for non-existent key', () => {
@@ -470,10 +471,10 @@ describe('db', () => {
       expect(tables.map((t) => t.name)).toContain('ignored_projects');
     });
 
-    it('should have user_version = 2', () => {
+    it('should have user_version = SCHEMA_VERSION', () => {
       const version = (db.pragma('user_version') as Array<{ user_version: number }>)[0]
         .user_version;
-      expect(version).toBe(2);
+      expect(version).toBe(SCHEMA_VERSION);
     });
 
     it('isProjectIgnored should return false for unknown project', () => {

@@ -32,38 +32,18 @@ export function loadSqliteVec(db: Database.Database): boolean {
 
 export function openDatabase(dbPath: string): DatabaseInfo {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  let db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
+  const db = new Database(dbPath);
   db.pragma('busy_timeout = 5000');
+  // Refuse a database written by newer code before touching it in any way.
+  try {
+    assertSchemaNotNewer(db);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+  db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   const vecEnabled = loadSqliteVec(db);
-
-  // Check if schema migration is needed — if so, delete the file and start fresh.
-  // Dropping FTS5/sqlite-vec virtual tables inside a transaction causes SQLITE_LOCKED,
-  // so the cleanest approach is to nuke the file. The DB is a cache rebuilt from JSONL.
-  const version = (db.pragma('user_version') as Array<{ user_version: number }>)[0].user_version;
-  if (version > 0 && version < SCHEMA_VERSION) {
-    logger.warn(P, `Schema version ${version} → ${SCHEMA_VERSION}: resetting DB`);
-    db.close();
-    fs.unlinkSync(dbPath);
-    // Remove stale WAL/SHM files
-    try {
-      fs.unlinkSync(dbPath + '-wal');
-    } catch {
-      /* ignore */
-    }
-    try {
-      fs.unlinkSync(dbPath + '-shm');
-    } catch {
-      /* ignore */
-    }
-    db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    db.pragma('busy_timeout = 5000');
-    db.pragma('foreign_keys = ON');
-    loadSqliteVec(db);
-  }
-
   const schemaReady = initSchema(db, vecEnabled);
   return { db, vecEnabled, schemaReady };
 }
@@ -76,31 +56,120 @@ export function openMemoryDatabase(): DatabaseInfo {
   return { db, vecEnabled, schemaReady };
 }
 
-const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
- * Create the full schema in a single pass. Idempotent — skips if DB is
- * already at the current SCHEMA_VERSION.
+ * The database is NOT a cache: most archived sessions no longer have a transcript on
+ * disk, so it is the only copy of that history. Schema changes are therefore additive
+ * steps keyed by user_version. A step may create tables, indexes and columns, or fix
+ * data in place; it never drops or recreates sessions, chunks, memories or tombstones.
  *
- * When the version changes (e.g. table renames in v0.9.1), all tables are
- * dropped and recreated. This is safe pre-1.0 — the DB is a cache that
- * gets rebuilt from JSONL source files on next startup.
+ * Step N upgrades user_version N-1 to N. `ddl` (virtual tables, which SQLite cannot
+ * create inside every transaction) runs first and must be idempotent; `run` and the
+ * version bump then commit together in one IMMEDIATE transaction, so a failure leaves
+ * the database openable at the previous version.
  */
-export function initSchema(db: Database.Database, vecEnabled: boolean): boolean {
-  const version = (db.pragma('user_version') as Array<{ user_version: number }>)[0].user_version;
-  if (version === SCHEMA_VERSION) return true;
+export interface SchemaStep {
+  version: number;
+  name: string;
+  ddl?: (db: Database.Database) => void;
+  run: (db: Database.Database) => void;
+}
 
-  // For file DBs, openDatabase() handles migration by deleting the file.
-  // For :memory: DBs (tests), just drop everything via the old table-by-table approach.
-  if (version > 0 && version < SCHEMA_VERSION) {
-    const tables = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-      .all() as Array<{ name: string }>;
-    for (const { name } of tables) {
-      db.exec(`DROP TABLE IF EXISTS "${name}"`);
-    }
+export const SCHEMA_STEPS: readonly SchemaStep[] = [
+  {
+    version: 3,
+    name: 'pending vector cleanup queue; ISO-8601 chunk timestamps',
+    run: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS pending_vec_cleanup (
+          vec_table TEXT NOT NULL,
+          vec_rowid INTEGER NOT NULL,
+          queued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          PRIMARY KEY (vec_table, vec_rowid)
+        );
+      `);
+      // Manual saves wrote datetime('now') (a space, UTC). Lexical date filters compare
+      // against ISO bounds, so rewrite those few rows in the T form everything else uses.
+      db.prepare(
+        `UPDATE conv_chunks SET timestamp = strftime('%Y-%m-%dT%H:%M:%fZ', timestamp)
+         WHERE timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:*'`,
+      ).run();
+    },
+  },
+];
+
+export class SchemaVersionError extends Error {}
+
+function userVersion(db: Database.Database): number {
+  return db.pragma('user_version', { simple: true }) as number;
+}
+
+function assertSchemaNotNewer(db: Database.Database): void {
+  const version = userVersion(db);
+  if (version > SCHEMA_VERSION) {
+    throw new SchemaVersionError(
+      `Database schema version ${version} is newer than this melchizedek supports (${SCHEMA_VERSION}). ` +
+        'Upgrade melchizedek; the database was left untouched.',
+    );
   }
+}
 
+function isBusy(err: unknown): boolean {
+  const code = (err as { code?: string }).code;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
+}
+
+/**
+ * Bring the schema to SCHEMA_VERSION without destroying data. Idempotent and safe
+ * when several processes open the database at once (each step re-checks the version
+ * inside its write transaction). Returns false when another writer holds the lock
+ * past busy_timeout; callers then skip work and retry on the next open.
+ */
+export function initSchema(
+  db: Database.Database,
+  vecEnabled: boolean,
+  steps: readonly SchemaStep[] = SCHEMA_STEPS,
+): boolean {
+  assertSchemaNotNewer(db);
+  const target = steps.length > 0 ? steps[steps.length - 1].version : 2;
+  if (userVersion(db) >= target) return true;
+
+  try {
+    if (userVersion(db) < 2) {
+      if (userVersion(db) === 1) {
+        // Pre-0.9.1 layout. Its tables are kept untouched beside the new ones.
+        logger.warn(P, 'Schema version 1 found: legacy tables kept; creating current schema');
+      }
+      createBaseSchema(db);
+      db.transaction(() => {
+        if (userVersion(db) < 2) db.pragma('user_version = 2');
+      }).immediate();
+      if (vecEnabled) createVecTables(db, 384, '_text');
+    }
+
+    for (const step of steps) {
+      if (userVersion(db) >= step.version) continue;
+      step.ddl?.(db);
+      db.transaction(() => {
+        if (userVersion(db) >= step.version) return; // another process got there first
+        step.run(db);
+        db.pragma(`user_version = ${step.version}`);
+      }).immediate();
+      logger.info(P, `Schema upgraded to version ${step.version}: ${step.name}`);
+    }
+    return true;
+  } catch (err) {
+    if (isBusy(err)) {
+      logger.warn(P, 'Schema upgrade deferred: database is locked by another writer');
+      return false;
+    }
+    throw err;
+  }
+}
+
+/** The version-2 tables (unchanged from 1.0.2). Idempotent. */
+function createBaseSchema(db: Database.Database): void {
   db.exec(`
     -- Conversation sessions
     CREATE TABLE IF NOT EXISTS conv_sessions (
@@ -186,16 +255,7 @@ export function initSchema(db: Database.Database, vecEnabled: boolean): boolean 
       project    TEXT PRIMARY KEY,
       ignored_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-
-    PRAGMA user_version = ${SCHEMA_VERSION};
   `);
-
-  // Vec tables are conditional on sqlite-vec availability
-  if (vecEnabled) {
-    createVecTables(db, 384, '_text');
-  }
-
-  return true;
 }
 
 // --- Stats CRUD ---
