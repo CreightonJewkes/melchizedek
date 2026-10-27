@@ -80,7 +80,8 @@ export function searchBM25(db: Database.Database, expr: string, limit: number): 
   return rows.map((row) => ({
     chunkId: row.id,
     snippet: (row.user_content + ' ' + row.assistant_content).slice(0, 100),
-    score: row.score,
+    // SQLite's bm25() is lower-is-better; every score in this module is higher-is-better.
+    score: -row.score,
     project: row.project,
     timestamp: row.timestamp,
     matchType: 'bm25' as const,
@@ -207,11 +208,25 @@ export function fusionRRF(lists: SearchResult[][], k = RRF_K): SearchResult[] {
 
 /**
  * Project boost factor: results from currentProject get a score boost.
- * Applied as multiplier for positive scores, divisor for negative scores (BM25).
+ * Applied as a multiplier on the fused (or reranked rank) score, which is always positive.
  * Moderate enough to promote same-project results without hiding cross-project ones.
  */
 const PROJECT_BOOST_FACTOR = 1.5;
 const SESSION_BOOST_FACTOR = 1.2;
+
+/** Score for position i of a final ranking, on the same scale as one RRF channel. */
+function rankScore(i: number): number {
+  return 1 / (RRF_K + i + 1);
+}
+
+function applyFilters(results: SearchResult[], options: SearchOptions): SearchResult[] {
+  return results.filter(
+    (r) =>
+      (!options.project || r.project === options.project) &&
+      (!options.since || r.timestamp >= options.since) &&
+      (!options.until || r.timestamp < options.until),
+  );
+}
 
 export async function search(
   db: Database.Database,
@@ -271,40 +286,24 @@ export async function search(
     }
   }
 
-  results = vecLists.length > 1 ? fusionRRF(vecLists) : bm25Results;
+  // Every channel goes through RRF, even alone, so scores share one direction and scale.
+  results = applyFilters(fusionRRF(vecLists), options);
   logger.debug('search', ` RRF: ${(performance.now() - t1).toFixed(0)}ms total`);
 
-  // Filter by project if specified
-  if (options.project) {
-    results = results.filter((r) => r.project === options.project);
-  }
-
-  // Filter by date if specified
-  if (options.since) {
-    results = results.filter((r) => r.timestamp >= options.since!);
-  }
-  if (options.until) {
-    results = results.filter((r) => r.timestamp < options.until!);
-  }
-
-  // Auto-fuzzy fallback: if fewer than threshold results, try wildcard search
+  // Auto-fuzzy fallback: too few results -> prefix search, fused as its own channel
   if (results.length < autoFuzzyThreshold) {
     const fuzzyResults = searchFuzzy(db, options.query, options.limit * 2);
-    // Merge: add fuzzy results that aren't already in exact results
-    const existingIds = new Set(results.map((r) => r.chunkId));
-    for (const fr of fuzzyResults) {
-      if (!existingIds.has(fr.chunkId)) {
-        // Apply same filters
-        if (options.project && fr.project !== options.project) continue;
-        if (options.since && fr.timestamp < options.since) continue;
-        if (options.until && fr.timestamp >= options.until) continue;
-        results.push(fr);
-        existingIds.add(fr.chunkId);
-      }
+    if (fuzzyResults.length > 0) {
+      // Prefix matches re-rank, but don't relabel what the other channels already found.
+      const types = new Map(fusionRRF(vecLists).map((r) => [r.chunkId, r.matchType]));
+      results = applyFilters(fusionRRF([...vecLists, fuzzyResults]), options).map((r) =>
+        types.has(r.chunkId) ? { ...r, matchType: types.get(r.chunkId)! } : r,
+      );
     }
   }
 
-  // Reranker: cross-encoder reorders pre-limit results by relevance
+  // Reranker: cross-encoder reorders pre-limit results by relevance. Its logits are
+  // replaced by rank scores on the RRF scale, so later multipliers stay well-defined.
   const tRerank0 = performance.now();
   if (ctx?.reranker && results.length > 1) {
     try {
@@ -321,39 +320,23 @@ export async function search(
       });
 
       const reranked = await ctx.reranker.rerank(options.query, documents, options.limit);
-      const rerankedMap = new Map(reranked.map((rr, i) => [rr.id, { score: rr.score, rank: i }]));
-
-      results = results
-        .filter((r) => rerankedMap.has(r.chunkId))
-        .sort((a, b) => {
-          const ra = rerankedMap.get(a.chunkId)!;
-          const rb = rerankedMap.get(b.chunkId)!;
-          return ra.rank - rb.rank;
-        })
-        .map((r) => ({ ...r, score: rerankedMap.get(r.chunkId)!.score }));
+      const byId = new Map(results.map((r) => [r.chunkId, r]));
+      results = reranked
+        .filter((rr) => byId.has(rr.id))
+        .map((rr, i) => ({ ...byId.get(rr.id)!, score: rankScore(i) }));
     } catch (err) {
       logger.warn('search', 'Reranker failed — keeping original order', err);
     }
   }
   logger.debug('search', ` reranker: ${(performance.now() - tRerank0).toFixed(0)}ms`);
 
-  // Project affinity boost: promote current project results when no strict project filter
-  if (!options.project && options.currentProject) {
+  // Affinity boosts multiply the (positive) fused or rank score, before the final cut.
+  const projectBoost = !options.project && options.currentProject ? PROJECT_BOOST_FACTOR : 1;
+  const sessionBoost = options.currentSession ? SESSION_BOOST_FACTOR : 1;
+  if (projectBoost !== 1 || sessionBoost !== 1) {
     for (const r of results) {
-      if (r.project === options.currentProject) {
-        // Handle both positive (RRF/reranker) and negative (raw BM25) scores
-        r.score = r.score >= 0 ? r.score * PROJECT_BOOST_FACTOR : r.score / PROJECT_BOOST_FACTOR;
-      }
-    }
-    results.sort((a, b) => b.score - a.score);
-  }
-
-  // Session affinity boost: promote current session results (weaker than project boost)
-  if (options.currentSession) {
-    for (const r of results) {
-      if (r.sessionId === options.currentSession) {
-        r.score = r.score >= 0 ? r.score * SESSION_BOOST_FACTOR : r.score / SESSION_BOOST_FACTOR;
-      }
+      if (projectBoost !== 1 && r.project === options.currentProject) r.score *= projectBoost;
+      if (sessionBoost !== 1 && r.sessionId === options.currentSession) r.score *= sessionBoost;
     }
     results.sort((a, b) => b.score - a.score);
   }

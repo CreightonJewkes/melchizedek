@@ -232,7 +232,8 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
         return {
           chunkId: r.chunkId,
           snippet: r.snippet,
-          score: r.score + metadataBonus,
+          // Multiplicative, so the bonus means the same whatever the score scale.
+          score: r.score * (1 + metadataBonus),
           metadataBonus,
           project: r.project,
           timestamp: r.timestamp,

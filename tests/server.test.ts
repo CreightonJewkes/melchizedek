@@ -1085,8 +1085,15 @@ describe('MCP server with reranker', () => {
 
     const data = JSON.parse((result.content as Array<{ text: string }>)[0].text);
     expect(data.length).toBeGreaterThan(1);
-    // Reranker boosts "middleware" mentions — top result should have score 10
-    expect(data[0].score).toBe(10);
+    // Reranker boosts "middleware" mentions, so a middleware chunk ranks first. Scores are
+    // rank scores on the RRF scale (logits are not comparable across rerankers).
+    const full = await client.callTool({
+      name: 'm9k_full',
+      arguments: { chunkIds: [data[0].chunkId] },
+    });
+    const top = JSON.parse((full.content as Array<{ text: string }>)[0].text)[0];
+    expect((top.user_content + ' ' + top.assistant_content).toLowerCase()).toContain('middleware');
+    expect(data[0].score).toBeGreaterThan(data[1].score);
   });
 
   it('m9k_info should show reranker in search section', async () => {
