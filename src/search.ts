@@ -49,10 +49,46 @@ function recordFtsError(err: unknown, expr: string): void {
   logger.warn('search', `Keyword search failed (${kind}): ${message} — ${expr.slice(0, 80)}`);
 }
 
+/** Scope applied inside every channel, before its candidate cut. Dates are ISO-8601 UTC. */
+export interface SearchFilters {
+  project?: string;
+  since?: string;
+  until?: string;
+}
+
+function hasFilters(f?: SearchFilters): f is SearchFilters {
+  return !!(f && (f.project || f.since || f.until));
+}
+
+/** SQL conditions on aliases c (chunk) and s (session), plus their parameters. */
+function filterSql(f?: SearchFilters): { sql: string; params: string[] } {
+  const parts: string[] = [];
+  const params: string[] = [];
+  if (f?.project) {
+    parts.push('s.project = ?');
+    params.push(f.project);
+  }
+  if (f?.since) {
+    parts.push('c.timestamp >= ?');
+    params.push(f.since);
+  }
+  if (f?.until) {
+    parts.push('c.timestamp < ?');
+    params.push(f.until);
+  }
+  return { sql: parts.map((p) => ` AND ${p}`).join(''), params };
+}
+
 /** BM25 over an FTS5 expression (build it with buildFtsQuery). Never throws. */
-export function searchBM25(db: Database.Database, expr: string, limit: number): SearchResult[] {
+export function searchBM25(
+  db: Database.Database,
+  expr: string,
+  limit: number,
+  filters?: SearchFilters,
+): SearchResult[] {
   if (!expr.trim()) return [];
 
+  const f = filterSql(filters);
   const stmt = db.prepare(`
     SELECT c.id, c.session_id, c.timestamp, c.user_content, c.assistant_content,
            s.project, bm25(conv_chunks_fts) AS score
@@ -60,7 +96,7 @@ export function searchBM25(db: Database.Database, expr: string, limit: number): 
     JOIN conv_chunks c ON conv_chunks_fts.rowid = c.rowid
     JOIN conv_sessions s ON c.session_id = s.id
     WHERE conv_chunks_fts MATCH ?
-      AND c.deleted_at IS NULL
+      AND c.deleted_at IS NULL${f.sql}
     ORDER BY score
     LIMIT ?
   `);
@@ -76,7 +112,7 @@ export function searchBM25(db: Database.Database, expr: string, limit: number): 
   }>;
 
   try {
-    rows = stmt.all(expr, limit) as typeof rows;
+    rows = stmt.all(expr, ...f.params, limit) as typeof rows;
   } catch (err) {
     recordFtsError(err, expr);
     return [];
@@ -107,7 +143,12 @@ export function searchVectorized(
   limit: number,
   maxDistance = MAX_VECTOR_DISTANCE,
   suffix = '_text',
+  filters?: SearchFilters,
 ): SearchResult[] {
+  if (hasFilters(filters)) {
+    return searchVectorizedScoped(db, queryEmbedding, limit, maxDistance, suffix, filters);
+  }
+
   // Two-step approach: sqlite-vec virtual tables are slow when JOINed directly
   // with regular tables (SQLite optimizer can't push down the MATCH efficiently).
   // Step 1: KNN search on the vec table only (~2ms for 5k vectors)
@@ -180,6 +221,54 @@ export function searchVectorized(
 }
 
 /**
+ * Filtered vector search, exact: every vector is scored and the scope is applied before
+ * the top-k cut, so a match inside the scope is found however far down the global
+ * nearest-neighbour list it sits. The scan-first join order keeps the cost close to an
+ * unfiltered KNN query (vec0 is itself a flat scan).
+ */
+function searchVectorizedScoped(
+  db: Database.Database,
+  queryEmbedding: Float32Array,
+  limit: number,
+  maxDistance: number,
+  suffix: string,
+  filters: SearchFilters,
+): SearchResult[] {
+  const f = filterSql(filters);
+  const rows = db
+    .prepare(
+      `SELECT c.id, c.user_content, c.assistant_content, c.session_id, c.timestamp, s.project,
+              v.distance
+       FROM (SELECT rowid AS vec_rowid, vec_distance_l2(embedding, ?) AS distance
+             FROM conv_vec${suffix}) v
+       CROSS JOIN conv_vec_map${suffix} m ON m.vec_rowid = v.vec_rowid
+       CROSS JOIN conv_chunks c ON c.id = m.chunk_id
+       CROSS JOIN conv_sessions s ON s.id = c.session_id
+       WHERE c.deleted_at IS NULL AND v.distance <= ?${f.sql}
+       ORDER BY v.distance
+       LIMIT ?`,
+    )
+    .all(Buffer.from(queryEmbedding.buffer), maxDistance, ...f.params, limit) as Array<{
+    id: string;
+    user_content: string;
+    assistant_content: string;
+    session_id: string;
+    timestamp: string;
+    project: string;
+    distance: number;
+  }>;
+  return rows.map((row) => ({
+    chunkId: row.id,
+    snippet: (row.user_content + ' ' + row.assistant_content).slice(0, 100),
+    score: 1 - row.distance,
+    project: row.project,
+    timestamp: row.timestamp,
+    matchType: (suffix === '_code' ? 'vector_code' : 'vector_text') as MatchType,
+    sessionId: row.session_id,
+  }));
+}
+
+/**
  * Reciprocal Rank Fusion: combines N ranked lists.
  * score(doc) = sum over lists of 1/(K + rank_in_list)
  * matchType is 'hybrid' when a doc appears in 2+ lists.
@@ -224,15 +313,6 @@ function rankScore(i: number): number {
   return 1 / (RRF_K + i + 1);
 }
 
-function applyFilters(results: SearchResult[], options: SearchOptions): SearchResult[] {
-  return results.filter(
-    (r) =>
-      (!options.project || r.project === options.project) &&
-      (!options.since || r.timestamp >= options.since) &&
-      (!options.until || r.timestamp < options.until),
-  );
-}
-
 export async function search(
   db: Database.Database,
   options: SearchOptions,
@@ -243,8 +323,15 @@ export async function search(
   const t0 = performance.now();
   const autoFuzzyThreshold = ctx?.autoFuzzyThreshold ?? 3;
 
+  // Every channel applies the scope itself, before its own cut.
+  const filters: SearchFilters = {
+    project: options.project,
+    since: options.since,
+    until: options.until,
+  };
+
   // BM25 search (always available)
-  const bm25Results = searchBM25(db, buildFtsQuery(options.query), options.limit * 2);
+  const bm25Results = searchBM25(db, buildFtsQuery(options.query), options.limit * 2, filters);
   const t1 = performance.now();
   logger.debug('search', ` BM25: ${(t1 - t0).toFixed(0)}ms (${bm25Results.length} results)`);
 
@@ -266,7 +353,9 @@ export async function search(
       const emb = await embedFn.call(ctx.embedderText, options.query);
       const t3 = performance.now();
       logger.debug('search', ` text embed: ${(t3 - t2).toFixed(0)}ms`);
-      vecLists.push(searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_text'));
+      vecLists.push(
+        searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_text', filters),
+      );
       logger.debug('search', ` text vec search: ${(performance.now() - t3).toFixed(0)}ms`);
     } catch (err) {
       logger.warn('search', 'Text vector search failed — degrading gracefully', err);
@@ -284,7 +373,9 @@ export async function search(
       const emb = await embedFn.call(ctx.embedderCode, options.query);
       const t5 = performance.now();
       logger.debug('search', ` code embed: ${(t5 - t4).toFixed(0)}ms`);
-      vecLists.push(searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_code'));
+      vecLists.push(
+        searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_code', filters),
+      );
       logger.debug('search', ` code vec search: ${(performance.now() - t5).toFixed(0)}ms`);
     } catch (err) {
       logger.warn('search', 'Code vector search failed — degrading gracefully', err);
@@ -292,16 +383,16 @@ export async function search(
   }
 
   // Every channel goes through RRF, even alone, so scores share one direction and scale.
-  results = applyFilters(fusionRRF(vecLists), options);
+  results = fusionRRF(vecLists);
   logger.debug('search', ` RRF: ${(performance.now() - t1).toFixed(0)}ms total`);
 
   // Auto-fuzzy fallback: too few results -> prefix search, fused as its own channel
   if (results.length < autoFuzzyThreshold) {
-    const fuzzyResults = searchFuzzy(db, options.query, options.limit * 2);
+    const fuzzyResults = searchFuzzy(db, options.query, options.limit * 2, filters);
     if (fuzzyResults.length > 0) {
       // Prefix matches re-rank, but don't relabel what the other channels already found.
       const types = new Map(fusionRRF(vecLists).map((r) => [r.chunkId, r.matchType]));
-      results = applyFilters(fusionRRF([...vecLists, fuzzyResults]), options).map((r) =>
+      results = fusionRRF([...vecLists, fuzzyResults]).map((r) =>
         types.has(r.chunkId) ? { ...r, matchType: types.get(r.chunkId)! } : r,
       );
     }
@@ -378,9 +469,14 @@ export async function search(
  * Prefix fallback ("fuzzy" here means prefix expansion, not typo correction): each term
  * of 3+ letters or digits becomes a quoted prefix phrase ("term"*), joined with OR.
  */
-export function searchFuzzy(db: Database.Database, query: string, limit: number): SearchResult[] {
+export function searchFuzzy(
+  db: Database.Database,
+  query: string,
+  limit: number,
+  filters?: SearchFilters,
+): SearchResult[] {
   const expr = buildFtsQuery(query, { prefix: true, minChars: 3 });
   if (!expr) return [];
-  const results = searchBM25(db, expr, limit);
+  const results = searchBM25(db, expr, limit, filters);
   return results.map((r) => ({ ...r, matchType: 'fuzzy' as const }));
 }

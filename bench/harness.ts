@@ -4,7 +4,7 @@
  *
  * Usage:
  *   tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir> [--set main|hard|errors|files]
- *                        [--model <registry key>] [--no-rerank] [--limit 10] [--readonly]
+ *                        [--model <registry key>] [--no-rerank] [--limit 10]
  *
  * Model files are read from M9K_MODEL_CACHE (a transformers.js cache dir) when set; remote downloads
  * stay off. Boosts are neutral (no currentProject / currentSession). Nothing here writes to the DB
@@ -14,9 +14,9 @@
 import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
-import Database from 'better-sqlite3';
 import { env } from '@huggingface/transformers';
-import { loadSqliteVec } from '../src/db.js';
+import { openDatabase } from '../src/db.js';
+import { resolveDateRange } from '../src/dates.js';
 import * as S from '../src/search.js';
 import { TransformersJsEmbedder } from '../src/embedder.js';
 import { TransformersJsReranker } from '../src/reranker.js';
@@ -60,8 +60,9 @@ if (!dbPath || !queriesPath || !outDir) {
 if (process.env.M9K_MODEL_CACHE) env.cacheDir = process.env.M9K_MODEL_CACHE;
 env.allowRemoteModels = false;
 
-const db = new Database(dbPath, { readonly: flag('readonly') });
-if (!loadSqliteVec(db)) throw new Error('sqlite-vec failed to load');
+// openDatabase runs the real schema upgrade on the copy, as the daemon would.
+const { db, vecEnabled } = openDatabase(dbPath);
+if (!vecEnabled) throw new Error('sqlite-vec failed to load');
 
 const spec = lookupModelSpec(modelKey);
 if (!spec) throw new Error(`unknown model key ${modelKey}`);
@@ -130,7 +131,21 @@ async function main(): Promise<void> {
   const latencies: number[] = [];
 
   for (const q of queries) {
-    const o = { ...q.opts };
+    // Dates go through the same normalisation as the m9k_search tool; a rejected date is
+    // recorded as that query's tool error (empty result), as the tool would return it.
+    let o: Query['opts'];
+    try {
+      o = { ...q.opts, ...resolveDateRange({ since: q.opts.since, until: q.opts.until }) };
+    } catch (err) {
+      out.write(
+        JSON.stringify({
+          id: q.id,
+          dateError: String(err),
+          runs: { full: [], full_norerank: [], bm25: [], vector: [], fuzzy: [] },
+        }) + '\n',
+      );
+      continue;
+    }
     const syntaxBefore = S.ftsErrorCounts?.syntax ?? 0;
     const rec: Record<string, unknown> = { id: q.id, ftsError: rawFtsError(q.query) };
     const runs: Record<string, string[]> = {};

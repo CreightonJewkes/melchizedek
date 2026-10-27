@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getStat } from '../db.js';
 import { search } from '../search.js';
+import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 import type { ToolContext } from './context.js';
 
 export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
@@ -21,11 +22,18 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           .optional()
           .describe('Filter by project path. Omit for cross-project search.'),
         limit: z.number().int().min(1).max(50).default(10).describe('Max results'),
-        since: z.string().optional().describe('ISO-8601 date. Only results after this date.'),
+        since: z
+          .string()
+          .optional()
+          .describe(
+            'ISO-8601 date (local time unless it has an offset). Only results from then on.',
+          ),
         until: z
           .string()
           .optional()
-          .describe('ISO-8601 date. Only results before this date (exclusive).'),
+          .describe(
+            'ISO-8601 date (local time unless it has an offset). Only results before it (exclusive).',
+          ),
         order: z
           .enum(['score', 'date_asc', 'date_desc'])
           .default('score')
@@ -45,6 +53,13 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
       },
     },
     async ({ query, project, limit, since, until, order }) => {
+      let range;
+      try {
+        range = resolveDateRange({ since, until });
+      } catch (err) {
+        if (err instanceof DateInputError) return dateErrorResult(err);
+        throw err;
+      }
       const currentSession = getStat(ctx.db, 'current_session_id') || undefined;
       const results = await search(
         ctx.db,
@@ -54,8 +69,8 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           currentProject: ctx.currentProject,
           currentSession,
           limit,
-          since,
-          until,
+          since: range.since,
+          until: range.until,
           order,
         },
         ctx.searchContext,
