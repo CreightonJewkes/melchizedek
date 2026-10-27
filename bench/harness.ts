@@ -131,6 +131,7 @@ async function main(): Promise<void> {
 
   for (const q of queries) {
     const o = { ...q.opts };
+    const syntaxBefore = S.ftsErrorCounts?.syntax ?? 0;
     const rec: Record<string, unknown> = { id: q.id, ftsError: rawFtsError(q.query) };
     const runs: Record<string, string[]> = {};
 
@@ -148,7 +149,8 @@ async function main(): Promise<void> {
 
     if (set !== 'files') {
       const emb = await (embedder.embedQuery ?? embedder.embed).call(embedder, q.query);
-      const bm25raw = S.searchBM25(db, q.query, LIMIT * 2);
+      const expr = S.buildFtsQuery ? S.buildFtsQuery(q.query) : q.query;
+      const bm25raw = S.searchBM25(db, expr, LIMIT * 2);
       const vecraw = S.searchVectorized(db, emb, LIMIT * 2);
       const fuzzyraw = S.searchFuzzy(db, q.query, LIMIT * 2);
       runs.bm25 = ids(applyFilters(bm25raw, o)).slice(0, LIMIT);
@@ -172,6 +174,7 @@ async function main(): Promise<void> {
         s: +r.score.toFixed(3),
       }));
     }
+    rec.bm25SyntaxErrors = (S.ftsErrorCounts?.syntax ?? 0) - syntaxBefore;
     rec.runs = runs;
     out.write(JSON.stringify(rec) + '\n');
   }

@@ -9,8 +9,44 @@ import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
 import { vectorIndexMatches } from './migration.js';
 
-export function searchBM25(db: Database.Database, query: string, limit: number): SearchResult[] {
-  if (!query.trim()) return [];
+/** Upper bound on OR terms in one keyword expression (a safety limit, not pruning). */
+export const MAX_QUERY_TERMS = 128;
+
+/**
+ * Turn user text into a safe FTS5 expression: whitespace-separated terms, each quoted as a
+ * phrase (inner quotes doubled), joined with OR. Quoting makes punctuation, operator words
+ * (AND, OR, NOT, NEAR) and stray quotes literal, so the expression can never be a syntax
+ * error; a dotted or hyphenated name stays one phrase ("test_config.py" matches the tokens
+ * test config py in order). Terms with no letter or digit are dropped. Returns '' when
+ * nothing searchable remains.
+ */
+export function buildFtsQuery(text: string, prefix = false): string {
+  const terms = text
+    .split(/\s+/u)
+    .filter((t) => /[\p{L}\p{N}]/u.test(t))
+    .slice(0, MAX_QUERY_TERMS);
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"${prefix ? '*' : ''}`).join(' OR ');
+}
+
+/** Keyword-search failures by cause, since process start (reported by m9k_info). */
+export const ftsErrorCounts = { syntax: 0, busy: 0, other: 0 };
+
+function recordFtsError(err: unknown, expr: string): void {
+  const code = (err as { code?: string }).code ?? '';
+  const message = err instanceof Error ? err.message : String(err);
+  const kind =
+    code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED'
+      ? 'busy'
+      : /fts5|syntax|unterminated|no such column/i.test(message)
+        ? 'syntax'
+        : 'other';
+  ftsErrorCounts[kind]++;
+  logger.warn('search', `Keyword search failed (${kind}): ${message} — ${expr.slice(0, 80)}`);
+}
+
+/** BM25 over an FTS5 expression (build it with buildFtsQuery). Never throws. */
+export function searchBM25(db: Database.Database, expr: string, limit: number): SearchResult[] {
+  if (!expr.trim()) return [];
 
   const stmt = db.prepare(`
     SELECT c.id, c.session_id, c.timestamp, c.user_content, c.assistant_content,
@@ -35,10 +71,9 @@ export function searchBM25(db: Database.Database, query: string, limit: number):
   }>;
 
   try {
-    rows = stmt.all(query, limit) as typeof rows;
-  } catch {
-    // FTS5 syntax error (unbalanced quotes, special chars, etc.) — return empty
-    logger.debug('search', `FTS5 syntax error for query: ${query.slice(0, 50)}`);
+    rows = stmt.all(expr, limit) as typeof rows;
+  } catch (err) {
+    recordFtsError(err, expr);
     return [];
   }
 
@@ -189,7 +224,7 @@ export async function search(
   const autoFuzzyThreshold = ctx?.autoFuzzyThreshold ?? 3;
 
   // BM25 search (always available)
-  const bm25Results = searchBM25(db, options.query, options.limit * 2);
+  const bm25Results = searchBM25(db, buildFtsQuery(options.query), options.limit * 2);
   const t1 = performance.now();
   logger.debug('search', ` BM25: ${(t1 - t0).toFixed(0)}ms (${bm25Results.length} results)`);
 

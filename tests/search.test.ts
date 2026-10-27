@@ -1199,10 +1199,12 @@ describe.skipIf(!hasWorkingEmbedder)('semantic search without keyword overlap (v
     const { MODEL_REGISTRY } = await import('../src/constants.js');
     const embedder = new TransformersJsEmbedder(MODEL_REGISTRY['minilm-l12-v2']);
 
-    // "containerize my application" should be closest to the Docker chunk
+    // "containerize application" should be closest to the Docker chunk. Keyword terms are
+    // OR-ed, so a shared stopword ("my") would add a keyword hit; keep content words only
+    // to isolate the vector effect.
     const results = await search(
       db,
-      { query: 'containerize my application', limit: 5 },
+      { query: 'containerize application', limit: 5 },
       {
         embedderText: embedder,
         embedderCode: null,
