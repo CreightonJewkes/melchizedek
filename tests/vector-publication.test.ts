@@ -8,30 +8,11 @@ import {
   vectorCounts,
   tempDbPath,
   sha,
+  staleMappedVectors,
 } from './helpers/fixtures.js';
 
-/** Every mapped vector must equal the embedding of its chunk's current text. */
-async function staleMapped(db: Database.Database, suffix = '_text'): Promise<string[]> {
-  const ref = new FakeEmbedder();
-  const rows = db
-    .prepare(
-      `SELECT m.chunk_id, v.embedding, c.user_content || ' ' || c.assistant_content AS content
-       FROM conv_vec_map${suffix} m JOIN conv_vec${suffix} v ON v.rowid = m.vec_rowid
-       JOIN conv_chunks c ON c.id = m.chunk_id`,
-    )
-    .all() as Array<{ chunk_id: string; embedding: Buffer; content: string }>;
-  const stale: string[] = [];
-  for (const r of rows) {
-    const stored = new Float32Array(
-      r.embedding.buffer,
-      r.embedding.byteOffset,
-      r.embedding.length / 4,
-    );
-    const want = await ref.embed(r.content);
-    if (want.some((x, i) => Math.abs(x - stored[i]) > 1e-6)) stale.push(r.chunk_id);
-  }
-  return stale;
-}
+const staleMapped = (db: Database.Database): Promise<string[]> =>
+  staleMappedVectors(db, new FakeEmbedder());
 
 function rewriteChunk(db: Database.Database, id: string, text: string): void {
   db.prepare('UPDATE conv_chunks SET user_content = ?, hash = ? WHERE id = ?').run(

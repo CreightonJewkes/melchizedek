@@ -275,8 +275,9 @@ export function archiveCounts(db: Database.Database): Record<string, number> {
 }
 
 /**
- * Deterministic bag-of-words embedder. Each lowercase word is hashed into one of `dims`
- * buckets, then the vector is L2-normalised, so texts sharing words are close.
+ * Deterministic bag-of-words embedder. Each lowercase word is hashed (with the model id)
+ * into one of `dims` buckets, then the vector is L2-normalised, so texts sharing words
+ * are close.
  * `onBatch` runs after inference and before the result is returned, which is where a
  * concurrent writer would act in production.
  */
@@ -321,7 +322,9 @@ export class FakeEmbedder implements Embedder {
   private vector(text: string): Float32Array {
     const v = new Float32Array(this.dims);
     for (const w of text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []) {
-      v[crypto.createHash('md5').update(w).digest().readUInt32LE(0) % this.dims] += 1;
+      // Salted by model id, so two fake models put the same text in different places.
+      const h = crypto.createHash('md5').update(`${this.id}:${w}`).digest();
+      v[h.readUInt32LE(0) % this.dims] += 1;
     }
     const norm = Math.hypot(...v) || 1;
     return v.map((x) => x / norm);
@@ -410,4 +413,32 @@ export function vectorCounts(db: Database.Database, suffix: string): { vec: numb
     vec: n(`SELECT COUNT(*) AS n FROM conv_vec${suffix}`),
     map: n(`SELECT COUNT(*) AS n FROM conv_vec_map${suffix}`),
   };
+}
+
+/** Chunks whose mapped vector is not `embedder`'s embedding of the chunk's current text. */
+export async function staleMappedVectors(
+  db: Database.Database,
+  embedder: FakeEmbedder,
+  suffix = '_text',
+): Promise<string[]> {
+  const rows = db
+    .prepare(
+      `SELECT m.chunk_id, v.embedding, c.user_content || ' ' || c.assistant_content AS content
+       FROM conv_vec_map${suffix} m JOIN conv_vec${suffix} v ON v.rowid = m.vec_rowid
+       JOIN conv_chunks c ON c.id = m.chunk_id`,
+    )
+    .all() as Array<{ chunk_id: string; embedding: Buffer; content: string }>;
+  const stale: string[] = [];
+  for (const r of rows) {
+    const stored = new Float32Array(
+      r.embedding.buffer,
+      r.embedding.byteOffset,
+      r.embedding.length / 4,
+    );
+    const want = await embedder.embed(r.content);
+    if (want.length !== stored.length || want.some((x, i) => Math.abs(x - stored[i]) > 1e-6)) {
+      stale.push(r.chunk_id);
+    }
+  }
+  return stale;
 }

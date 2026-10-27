@@ -35,6 +35,15 @@ function logMemory(label: string): void {
   logger.info(P, `RSS=${rss} MB, heap=${heap} MB — ${label}`);
 }
 
+function migrationFailureMessage(
+  suffix: string,
+  result: { embedded: number; aborted: boolean },
+): string {
+  return shutdownController.signal.aborted
+    ? `migration${suffix} paused at ${result.embedded} chunks; resumes on next run`
+    : `migration${suffix} failed after ${result.embedded} chunks; old index kept`;
+}
+
 function send(msg: WorkerOutMessage): void {
   if (process.send) {
     process.send(msg);
@@ -142,11 +151,13 @@ process.on('message', async (msg: WorkerInMessage) => {
     const resumed = EmbeddingMigration.resume(db, embedder, {
       suffix: msg.suffix,
       batchSize: msg.batchSize,
+      signal: shutdownController.signal,
     });
     const modelChange = detectModelChange(db, embedder, msg.suffix);
     dbg(`Migration check: resumed=${!!resumed}, modelChange=${!!modelChange}`);
 
     let totalEmbedded = 0;
+    let migrationFailure: string | null = null;
 
     const migrationProgress = (embedded: number, total: number) => {
       send({ type: 'progress', embedded, total });
@@ -159,17 +170,20 @@ process.on('message', async (msg: WorkerInMessage) => {
       const result = await resumed.run();
       totalEmbedded = result.embedded;
       dbg(`Migration ${result.swapped ? 'completed' : 'aborted'}: ${result.embedded} chunks`);
+      if (!result.swapped) migrationFailure = migrationFailureMessage(msg.suffix, result);
     } else if (modelChange) {
       dbg(`Model changed: ${modelChange.oldModelId} → ${modelChange.newModelId}`);
       const migration = new EmbeddingMigration(db, embedder, {
         suffix: msg.suffix,
         batchSize: msg.batchSize,
         onProgress: migrationProgress,
+        signal: shutdownController.signal,
       });
       dbg(`Calling migration.run() for ${msg.suffix} (fresh)`);
       const result = await migration.run();
       totalEmbedded = result.embedded;
       dbg(`Migration ${result.swapped ? 'completed' : 'aborted'}: ${result.embedded} chunks`);
+      if (!result.swapped) migrationFailure = migrationFailureMessage(msg.suffix, result);
     } else {
       // Normal backfill embedding
       dbg(`Starting backfill embedding for ${msg.suffix}`);
@@ -189,7 +203,9 @@ process.on('message', async (msg: WorkerInMessage) => {
 
     clearMemoryInterval();
     const durationMs = Date.now() - startTime;
-    send({ type: 'done', embedded: totalEmbedded, durationMs });
+    // A migration that did not publish is not "done": report it so status stays honest.
+    if (migrationFailure) send({ type: 'error', message: migrationFailure, fatal: true });
+    else send({ type: 'done', embedded: totalEmbedded, durationMs });
 
     // Close DB cleanly before exit
     db.close();

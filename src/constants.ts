@@ -25,6 +25,8 @@ export interface ModelSpec {
   maxInputChars: number;
   /** Instruction prefix for asymmetric models (e.g. Qwen3) — prepended to queries */
   queryPrefix?: string;
+  /** Prefix for indexed documents (e.g. 'passage: '); part of the embedding recipe */
+  documentPrefix?: string;
   /** Preferred dtype in order of attempt — first success wins */
   dtypePreference: Array<'q8' | 'fp16' | 'fp32'>;
 }

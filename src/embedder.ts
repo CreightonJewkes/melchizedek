@@ -47,6 +47,11 @@ export class TransformersJsEmbedder implements Embedder {
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
+    const prefix = this.spec.documentPrefix;
+    return this.embedRaw(prefix ? texts.map((t) => prefix + t) : texts);
+  }
+
+  private async embedRaw(texts: string[]): Promise<Float32Array[]> {
     const pipe = await this.getPipeline();
     if (!pipe)
       throw new Error(
@@ -73,7 +78,19 @@ export class TransformersJsEmbedder implements Embedder {
 
   async embedQuery(text: string): Promise<Float32Array> {
     const prefixed = this.spec.queryPrefix ? `${this.spec.queryPrefix} ${text}` : text;
-    return (await this.embedBatch([prefixed]))[0];
+    return (await this.embedRaw([prefixed]))[0];
+  }
+
+  recipe(): string {
+    const s = this.spec;
+    return JSON.stringify({
+      hf: s.hfModelId,
+      pooling: s.pooling,
+      query: s.queryPrefix ?? '',
+      document: s.documentPrefix ?? '',
+      input: s.maxInputChars,
+      dtype: s.dtypePreference[0],
+    });
   }
 
   dimensions(): number {
@@ -190,6 +207,10 @@ export class OllamaEmbedder implements Embedder {
 
   modelId(): string {
     return `ollama:${this.model}`;
+  }
+
+  recipe(): string {
+    return JSON.stringify({ ollama: this.model, input: 2_000 });
   }
 
   // Conservative default — Ollama models vary (nomic: 8192, mxbai: 512).

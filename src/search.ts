@@ -7,6 +7,7 @@ import type { MatchType, SearchContext, SearchOptions, SearchResult } from './mo
 import { incrementStat, setStat } from './db.js';
 import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
+import { vectorIndexMatches } from './migration.js';
 
 export function searchBM25(db: Database.Database, query: string, limit: number): SearchResult[] {
   if (!query.trim()) return [];
@@ -197,7 +198,13 @@ export async function search(
   // Triple vector search: BM25 + text vectors + code vectors, fused via RRF
   const vecLists: SearchResult[][] = [bm25Results];
 
-  if (ctx?.vecTextEnabled && ctx.embedderText) {
+  // A generation built by another model or recipe (or mid-migration) is skipped:
+  // keyword search keeps working, and vectors return once the new index is published.
+  if (
+    ctx?.vecTextEnabled &&
+    ctx.embedderText &&
+    vectorIndexMatches(db, ctx.embedderText, '_text')
+  ) {
     try {
       const t2 = performance.now();
       const embedFn = ctx.embedderText.embedQuery ?? ctx.embedderText.embed;
@@ -211,7 +218,11 @@ export async function search(
     }
   }
 
-  if (ctx?.vecCodeEnabled && ctx.embedderCode) {
+  if (
+    ctx?.vecCodeEnabled &&
+    ctx.embedderCode &&
+    vectorIndexMatches(db, ctx.embedderCode, '_code')
+  ) {
     try {
       const t4 = performance.now();
       const embedFn = ctx.embedderCode.embedQuery ?? ctx.embedderCode.embed;

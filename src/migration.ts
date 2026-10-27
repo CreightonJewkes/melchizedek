@@ -12,6 +12,9 @@ import {
   setMeta,
   deleteMeta,
   createVecTables,
+  recreateVecTables,
+  getVecTableDimensions,
+  countEmbeddedChunks,
   publishVectors,
   MIN_EMBED_CONTENT_LENGTH,
 } from './db.js';
@@ -21,6 +24,10 @@ const P = 'migration';
 
 // --- Seed + Detect ---
 
+export function embedderRecipe(embedder: Embedder): string {
+  return embedder.recipe?.() ?? '';
+}
+
 export function seedEmbeddingMeta(
   db: Database.Database,
   embedder: Embedder | null,
@@ -28,9 +35,14 @@ export function seedEmbeddingMeta(
 ): void {
   if (!embedder) return;
   const existing = getMeta(db, `embedding_model_id${suffix}`);
-  if (existing) return; // Already seeded
-  setMeta(db, `embedding_model_id${suffix}`, embedder.modelId());
-  setMeta(db, `embedding_dimensions${suffix}`, String(embedder.dimensions()));
+  if (!existing) {
+    setMeta(db, `embedding_model_id${suffix}`, embedder.modelId());
+    setMeta(db, `embedding_dimensions${suffix}`, String(embedder.dimensions()));
+    setMeta(db, `embedding_recipe${suffix}`, embedderRecipe(embedder));
+  } else if (existing === embedder.modelId() && !getMeta(db, `embedding_recipe${suffix}`)) {
+    // Databases from before recipe tags were built with the registry recipe of the day.
+    setMeta(db, `embedding_recipe${suffix}`, embedderRecipe(embedder));
+  }
 }
 
 export interface ModelChange {
@@ -38,6 +50,12 @@ export interface ModelChange {
   newModelId: string;
   oldDimensions: number;
   newDimensions: number;
+}
+
+/** A stored recipe that is missing reads as the embedder's current registry recipe. */
+function sameRecipe(db: Database.Database, embedder: Embedder, key: string): boolean {
+  const stored = getMeta(db, key);
+  return stored === null || stored === embedderRecipe(embedder);
 }
 
 export function detectModelChange(
@@ -48,7 +66,12 @@ export function detectModelChange(
   const storedModelId = getMeta(db, `embedding_model_id${suffix}`);
   if (!storedModelId) return null; // First time — no change to detect
 
-  if (storedModelId === embedder.modelId()) return null; // Same model
+  if (
+    storedModelId === embedder.modelId() &&
+    sameRecipe(db, embedder, `embedding_recipe${suffix}`)
+  ) {
+    return null; // Same model, same recipe
+  }
 
   const storedDimensions = parseInt(getMeta(db, `embedding_dimensions${suffix}`) ?? '0', 10);
 
@@ -58,6 +81,60 @@ export function detectModelChange(
     oldDimensions: storedDimensions,
     newDimensions: embedder.dimensions(),
   };
+}
+
+/**
+ * True when this generation's vectors were made by this embedder's exact recipe and
+ * no migration is replacing them. Search uses it to skip the vector channel, keeping
+ * keyword search, rather than compare query and index vectors from different models.
+ */
+export function vectorIndexMatches(
+  db: Database.Database,
+  embedder: Embedder,
+  suffix = '_text',
+): boolean {
+  if (getMeta(db, `migration_target_model${suffix}`)) return false;
+  const storedModelId = getMeta(db, `embedding_model_id${suffix}`);
+  if (storedModelId === null) return true; // nothing embedded under any model yet
+  return (
+    storedModelId === embedder.modelId() && sameRecipe(db, embedder, `embedding_recipe${suffix}`)
+  );
+}
+
+/**
+ * Make the primary vec tables fit this embedder without destroying vectors. Missing or
+ * empty tables of the wrong size are (re)created. Populated ones are kept: the embed
+ * worker re-embeds into the next generation and swaps atomically, and search skips
+ * vectors until then (vectorIndexMatches).
+ */
+export function reconcileVecTables(
+  db: Database.Database,
+  embedder: Embedder,
+  suffix = '_text',
+): void {
+  const tableDims = getVecTableDimensions(db, suffix);
+  const expected = embedder.dimensions();
+  if (tableDims === expected) return;
+  if (tableDims === null) {
+    createVecTables(db, expected, suffix);
+    return;
+  }
+  const mapped = countEmbeddedChunks(db, suffix);
+  if (mapped === 0) {
+    logger.info(P, `Recreating empty vec tables${suffix} for ${expected}d embeddings`);
+    recreateVecTables(db, expected, suffix);
+    return;
+  }
+  if (!getMeta(db, `embedding_model_id${suffix}`)) {
+    // Vectors of unknown origin: record them so the worker migrates instead of mixing.
+    setMeta(db, `embedding_model_id${suffix}`, 'unknown-legacy');
+    setMeta(db, `embedding_dimensions${suffix}`, String(tableDims));
+  }
+  logger.warn(
+    P,
+    `Vec tables${suffix} hold ${mapped} vectors at ${tableDims}d; keeping them until the ` +
+      `embed worker migrates to ${expected}d (vector search paused meanwhile)`,
+  );
 }
 
 // --- Migration result ---
@@ -74,6 +151,15 @@ export function acquireMigrationLock(
   db: Database.Database,
   instanceId?: string,
   suffix = '_text',
+): boolean {
+  // Check and claim in one write transaction, so two workers cannot both win.
+  return db.transaction(() => claimMigrationLock(db, instanceId, suffix)).immediate();
+}
+
+function claimMigrationLock(
+  db: Database.Database,
+  instanceId: string | undefined,
+  suffix: string,
 ): boolean {
   const existingLock = getMeta(db, `migration_lock${suffix}`);
   if (existingLock) {
@@ -143,6 +229,7 @@ export class EmbeddingMigration {
 
     setMeta(this.db, `migration_target_model${this.suffix}`, targetModel);
     setMeta(this.db, `migration_target_dimensions${this.suffix}`, String(targetDimensions));
+    setMeta(this.db, `migration_target_recipe${this.suffix}`, embedderRecipe(this.embedder));
     setMeta(this.db, `migration_progress${this.suffix}`, '0');
     setMeta(this.db, `migration_started_at${this.suffix}`, new Date().toISOString());
   }
@@ -167,15 +254,20 @@ export class EmbeddingMigration {
     );
 
     let batch = this.getNextBatch();
+    let previousIds = '';
     logger.debug(P, `reembed${this.suffix}: first batch size=${batch.length}`);
     while (batch.length > 0) {
       if (this.signal?.aborted) {
         return { embedded: totalEmbedded, aborted: true };
       }
 
+      const ids = batch.map((c) => `${c.id}:${c.hash}`).join(',');
+      if (ids === previousIds) throw new Error('re-embed made no progress on the same batch');
+
       logger.debug(P, `reembed${this.suffix}: embedding batch of ${batch.length} chunks`);
       const count = await this.reembedBatch(batch);
       totalEmbedded += count;
+      previousIds = count === 0 ? ids : '';
       logger.debug(P, `reembed${this.suffix}: batch done, total=${totalEmbedded}/${totalEligible}`);
 
       // Checkpoint
@@ -217,45 +309,52 @@ export class EmbeddingMigration {
     return publishVectors(this.db, vectorItems, `${this.suffix}_next`);
   }
 
-  /** Phase 3: Atomic swap — drop old, rename _next, update meta */
+  /**
+   * Phase 3: publish the next generation atomically. Old tables, the copy, the _next
+   * drop and the model meta change in ONE transaction (sqlite-vec >= 0.1.9 supports
+   * vec0 DDL inside it), so a failure at any step leaves the old generation searchable
+   * and the migration resumable. Only mapped vectors are copied.
+   */
   swap(): void {
-    const targetModel = getMeta(this.db, `migration_target_model${this.suffix}`)!;
-    const targetDimensions = parseInt(
-      getMeta(this.db, `migration_target_dimensions${this.suffix}`)!,
-      10,
-    );
+    const s = this.suffix;
+    const targetModel = getMeta(this.db, `migration_target_model${s}`)!;
+    const targetDimensions = parseInt(getMeta(this.db, `migration_target_dimensions${s}`)!, 10);
+    const targetRecipe =
+      getMeta(this.db, `migration_target_recipe${s}`) ?? embedderRecipe(this.embedder);
 
-    // Drop old vec + map tables
-    this.db.exec(`
-      DROP TABLE IF EXISTS conv_vec_map${this.suffix};
-      DROP TABLE IF EXISTS conv_vec${this.suffix};
-    `);
+    this.db
+      .transaction(() => {
+        this.db.exec(`
+          DROP TABLE IF EXISTS conv_vec_map${s};
+          DROP TABLE IF EXISTS conv_vec${s};
+        `);
 
-    // CRITICAL: sqlite-vec virtual tables cannot be safely renamed with
-    // ALTER TABLE RENAME — the backing tables (_info, _chunks, _rowids,
-    // _vector_chunks00) keep their old names, breaking INSERT/SELECT.
-    // Instead: create fresh vec table, copy data, then drop _next.
-    createVecTables(this.db, targetDimensions, this.suffix);
+        // CRITICAL: sqlite-vec virtual tables cannot be safely renamed with
+        // ALTER TABLE RENAME — the backing tables (_info, _chunks, _rowids,
+        // _vector_chunks00) keep their old names, breaking INSERT/SELECT.
+        // Instead: create fresh vec table, copy data, then drop _next.
+        createVecTables(this.db, targetDimensions, s);
 
-    // Copy vectors from _next into the fresh table
-    this.db.exec(`
-      INSERT INTO conv_vec${this.suffix}(rowid, embedding)
-        SELECT rowid, embedding FROM conv_vec${this.suffix}_next;
+        this.db.exec(`
+          INSERT INTO conv_vec${s}(rowid, embedding)
+            SELECT v.rowid, v.embedding FROM conv_vec_map${s}_next m
+            JOIN conv_vec${s}_next v ON v.rowid = m.vec_rowid;
 
-      INSERT INTO conv_vec_map${this.suffix}(vec_rowid, chunk_id)
-        SELECT vec_rowid, chunk_id FROM conv_vec_map${this.suffix}_next;
-    `);
+          INSERT INTO conv_vec_map${s}(vec_rowid, chunk_id)
+            SELECT vec_rowid, chunk_id FROM conv_vec_map${s}_next;
+        `);
 
-    // Drop _next tables
-    this.db.exec(`
-      DROP TABLE IF EXISTS conv_vec_map${this.suffix}_next;
-      DROP TABLE IF EXISTS conv_vec${this.suffix}_next;
-      DROP INDEX IF EXISTS idx_conv_vec_map_chunk${this.suffix}_next;
-    `);
+        this.db.exec(`
+          DROP TABLE IF EXISTS conv_vec_map${s}_next;
+          DROP TABLE IF EXISTS conv_vec${s}_next;
+        `);
 
-    setMeta(this.db, `embedding_model_id${this.suffix}`, targetModel);
-    setMeta(this.db, `embedding_dimensions${this.suffix}`, String(targetDimensions));
-    this.cleanupMigrationMeta();
+        setMeta(this.db, `embedding_model_id${s}`, targetModel);
+        setMeta(this.db, `embedding_dimensions${s}`, String(targetDimensions));
+        setMeta(this.db, `embedding_recipe${s}`, targetRecipe);
+        this.cleanupMigrationMeta();
+      })
+      .immediate();
   }
 
   /** Abort: drop _next tables, clean up meta */
@@ -275,6 +374,7 @@ export class EmbeddingMigration {
   private cleanupMigrationMeta(): void {
     deleteMeta(this.db, `migration_target_model${this.suffix}`);
     deleteMeta(this.db, `migration_target_dimensions${this.suffix}`);
+    deleteMeta(this.db, `migration_target_recipe${this.suffix}`);
     deleteMeta(this.db, `migration_progress${this.suffix}`);
     deleteMeta(this.db, `migration_started_at${this.suffix}`);
   }
@@ -311,7 +411,8 @@ export class EmbeddingMigration {
       const { embedded, aborted } = await this.reembed();
 
       if (aborted) {
-        this.abort();
+        // Cancelled (shutdown or timeout): keep _next and the checkpoint, so the next
+        // run resumes instead of re-embedding everything.
         return { embedded, aborted: true, swapped: false };
       }
 
@@ -348,7 +449,11 @@ export class EmbeddingMigration {
 
     const migration = new EmbeddingMigration(db, embedder, options);
 
-    if (targetModel !== embedder.modelId()) {
+    const targetRecipe = getMeta(db, `migration_target_recipe${suffix}`);
+    if (
+      targetModel !== embedder.modelId() ||
+      (targetRecipe !== null && targetRecipe !== embedderRecipe(embedder))
+    ) {
       // Target changed — abort old migration, return fresh instance
       migration.abort();
       return new EmbeddingMigration(db, embedder, options);

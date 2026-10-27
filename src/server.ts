@@ -6,19 +6,13 @@
 import { readFileSync } from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  openDatabase,
-  setStat,
-  getMeta,
-  recreateVecTables,
-  getVecTableDimensions,
-  drainPendingVecCleanup,
-} from './db.js';
+import { openDatabase, setStat, drainPendingVecCleanup } from './db.js';
 import { backfillExistingSessions, detectOrphanedSessions } from './indexer.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { detectRerankerBackend } from './reranker.js';
 import { getConfig } from './config.js';
 import { EmbedOrchestrator } from './embed-orchestrator.js';
+import { reconcileVecTables } from './migration.js';
 import { initLogger, logger } from './logger.js';
 import type { Embedder, Reranker, MelchizedekConfig, SearchContext } from './models.js';
 import type { DatabaseType, DatabaseInfo } from './db.js';
@@ -31,7 +25,6 @@ import {
 } from './tools/index.js';
 import type { ToolContext } from './tools/index.js';
 
-import { DEFAULT_TEXT_DIMENSIONS } from './constants.js';
 import net from 'net';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -257,27 +250,7 @@ async function runLocalMode(): Promise<void> {
         `Text embedder initialized (${embedderText.modelId()}, ${embedderText.dimensions()}d)`,
       );
 
-      if (vecEnabled) {
-        const tableDims = getVecTableDimensions(db, '_text');
-        const metaDims = getMeta(db, 'embedding_dimensions_text');
-        const expectedDims = embedderText.dimensions();
-        if (tableDims && tableDims !== expectedDims) {
-          logger.warn(
-            P,
-            `Vec table dimension mismatch (table=${tableDims} vs embedder=${expectedDims}d) — recreating`,
-          );
-          recreateVecTables(db, expectedDims);
-        } else if (metaDims && parseInt(metaDims, 10) !== expectedDims) {
-          logger.warn(
-            P,
-            `Vec meta dimension mismatch (meta=${metaDims} vs embedder=${expectedDims}d) — recreating`,
-          );
-          recreateVecTables(db, expectedDims);
-        } else if (!tableDims && !metaDims && expectedDims !== DEFAULT_TEXT_DIMENSIONS) {
-          logger.info(P, `Recreating vec tables for ${expectedDims}d embeddings`);
-          recreateVecTables(db, expectedDims);
-        }
-      }
+      if (vecEnabled) reconcileVecTables(db, embedderText, '_text');
     } else {
       logger.info(P, 'Text embedder not available — BM25 only');
     }

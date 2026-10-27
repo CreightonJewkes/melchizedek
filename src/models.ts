@@ -90,6 +90,11 @@ export interface Embedder {
   modelId(): string;
   /** Max safe input chars per text (embedder truncates internally). */
   maxInputChars(): number;
+  /**
+   * Everything besides the model ID that changes the vectors it produces (prefixes,
+   * pooling, input cap, dtype). Stored beside the model ID; a change means a re-embed.
+   */
+  recipe?(): string;
 }
 
 // --- Reranker ---
