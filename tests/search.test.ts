@@ -8,7 +8,14 @@ import {
   insertVectorsBatch,
   createVecTables,
 } from '../src/db.js';
-import { searchBM25, search, searchFuzzy, searchVectorized, fusionRRF } from '../src/search.js';
+import {
+  searchBM25,
+  search,
+  searchFuzzy,
+  searchVectorized,
+  fusionRRF,
+  RERANK_POOL,
+} from '../src/search.js';
 import { indexConvSession } from '../src/indexer.js';
 import type { SearchResult } from '../src/models.js';
 
@@ -802,7 +809,9 @@ describe('reranker integration in search pipeline', () => {
     );
 
     expect(capturedDocs.length).toBeGreaterThan(0);
-    expect(capturedTopN).toBe(5);
+    // The whole rerank pool is ordered (the output limit is applied afterwards).
+    expect(capturedTopN).toBe(capturedDocs.length);
+    expect(capturedTopN).toBeLessThanOrEqual(RERANK_POOL);
     // Each doc should have id and content
     for (const doc of capturedDocs) {
       expect(doc.id).toBeDefined();

@@ -308,6 +308,9 @@ export function fusionRRF(lists: SearchResult[][], k = RRF_K): SearchResult[] {
 const PROJECT_BOOST_FACTOR = 1.5;
 const SESSION_BOOST_FACTOR = 1.2;
 
+/** Fused candidates the cross-encoder scores per search (serially, in q8), whatever the limit. */
+export const RERANK_POOL = 20;
+
 /** Score for position i of a final ranking, on the same scale as one RRF channel. */
 function rankScore(i: number): number {
   return 1 / (RRF_K + i + 1);
@@ -398,28 +401,36 @@ export async function search(
     }
   }
 
-  // Reranker: cross-encoder reorders pre-limit results by relevance. Its logits are
-  // replaced by rank scores on the RRF scale, so later multipliers stay well-defined.
+  // Reranker: the cross-encoder reorders only the top RERANK_POOL fused candidates (its
+  // cost grows with the pool, not with the output limit); the rest keep fused order
+  // behind them. Logits become rank scores on the RRF scale, so later multipliers stay
+  // well-defined.
   const tRerank0 = performance.now();
   if (ctx?.reranker && results.length > 1) {
     try {
-      const documents = results.map((r) => {
-        const chunk = db
-          .prepare('SELECT user_content, assistant_content FROM conv_chunks WHERE id = ?')
-          .get(r.chunkId) as { user_content: string; assistant_content: string } | undefined;
-        return {
-          id: r.chunkId,
-          content: chunk
-            ? (chunk.user_content + ' ' + chunk.assistant_content).slice(0, 512)
-            : r.snippet,
-        };
-      });
+      const pool = results.slice(0, RERANK_POOL);
+      const ph = pool.map(() => '?').join(',');
+      const texts = new Map(
+        (
+          db
+            .prepare(
+              `SELECT id, user_content || ' ' || assistant_content AS content
+               FROM conv_chunks WHERE id IN (${ph})`,
+            )
+            .all(...pool.map((r) => r.chunkId)) as Array<{ id: string; content: string }>
+        ).map((row) => [row.id, row.content]),
+      );
+      const documents = pool.map((r) => ({
+        id: r.chunkId,
+        content: (texts.get(r.chunkId) ?? r.snippet).slice(0, 512),
+      }));
 
-      const reranked = await ctx.reranker.rerank(options.query, documents, options.limit);
-      const byId = new Map(results.map((r) => [r.chunkId, r]));
-      results = reranked
-        .filter((rr) => byId.has(rr.id))
-        .map((rr, i) => ({ ...byId.get(rr.id)!, score: rankScore(i) }));
+      const reranked = await ctx.reranker.rerank(options.query, documents, pool.length);
+      const byId = new Map(pool.map((r) => [r.chunkId, r]));
+      results = [
+        ...reranked.filter((rr) => byId.has(rr.id)).map((rr) => byId.get(rr.id)!),
+        ...results.slice(RERANK_POOL),
+      ].map((r, i) => ({ ...r, score: rankScore(i) }));
     } catch (err) {
       logger.warn('search', 'Reranker failed — keeping original order', err);
     }
