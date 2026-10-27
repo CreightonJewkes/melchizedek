@@ -14,7 +14,13 @@ import type {
   JnlMessage,
   OrphanDetectionResult,
 } from './models.js';
-import { getChunksWithoutEmbeddings, insertVectorsBatch, isProjectIgnored } from './db.js';
+import {
+  deleteChunksWhere,
+  deleteSessionsWhere,
+  getChunksWithoutEmbeddings,
+  insertVectorsBatch,
+  isProjectIgnored,
+} from './db.js';
 import { logger } from './logger.js';
 import { CONV_KIND_EXCHANGE } from './constants.js';
 
@@ -154,6 +160,9 @@ export function indexConvSession(
   project: string,
   jsonlPath: string,
 ): 'indexed' | 'skipped' {
+  // Every writer (startup backfill, SessionEnd, PreCompact) passes through here.
+  if (isProjectIgnored(db, project)) return 'skipped';
+
   const fileHash = crypto.createHash('sha256').update(jsonlContent).digest('hex');
 
   // Fast-check: skip if tombstoned (soft-deleted) or file_hash unchanged
@@ -185,9 +194,7 @@ export function indexConvSession(
 
   if (existingSession) {
     // Re-indexing: delete old chunks but preserve soft-deleted ones (forget tombstones)
-    db.prepare('DELETE FROM conv_chunks WHERE session_id = ? AND deleted_at IS NULL').run(
-      sessionId,
-    );
+    deleteChunksWhere(db, 'session_id = ? AND deleted_at IS NULL', [sessionId]);
     db.prepare(
       `UPDATE conv_sessions SET project = ?, jsonl_path = ?, file_hash = ?, file_size = ?,
        started_at = ?, ended_at = ?, message_count = ?, chunk_count = ?, indexed_at = datetime('now')
@@ -317,13 +324,12 @@ export function backfillExistingSessions(db: Database.Database, jsonlDir: string
   }
 
   // Clean up ghost sessions (message_count=0) from previous backfills
-  const deleted = db
-    .prepare(
-      "DELETE FROM conv_sessions WHERE message_count = 0 AND chunk_count = 0 AND id != '__manual_memories__'",
-    )
-    .run();
-  if (deleted.changes > 0) {
-    logger.info('indexer', `Backfill: cleaned up ${deleted.changes} ghost sessions`);
+  const ghosts = deleteSessionsWhere(
+    db,
+    "message_count = 0 AND chunk_count = 0 AND id != '__manual_memories__'",
+  );
+  if (ghosts.sessions > 0) {
+    logger.info('indexer', `Backfill: cleaned up ${ghosts.sessions} ghost sessions`);
   }
 
   return result;
@@ -353,7 +359,7 @@ export function detectOrphanedSessions(
     if (!fs.existsSync(session.jsonl_path)) {
       orphanedCount++;
       if (purge) {
-        db.prepare('DELETE FROM conv_sessions WHERE id = ?').run(session.id);
+        deleteSessionsWhere(db, 'id = ?', [session.id]);
         purgedCount++;
         logger.info('indexer', `Purged orphaned session: ${session.id}`);
       } else {

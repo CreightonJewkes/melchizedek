@@ -5,7 +5,13 @@
 import fs from 'fs';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { deleteVectorsForChunk, ignoreProject, unignoreProject, purgeProjectData } from '../db.js';
+import {
+  deleteChunksWhere,
+  deleteVectorsForChunks,
+  ignoreProject,
+  unignoreProject,
+  purgeProjectData,
+} from '../db.js';
 import { DAEMON_PID_PATH } from '../constants.js';
 import type { ToolContext } from './context.js';
 
@@ -43,18 +49,14 @@ export function registerManageTools(server: McpServer, ctx: ToolContext): void {
         };
       }
 
-      // Soft-delete the chunk
-      ctx.db
-        .prepare("UPDATE conv_chunks SET deleted_at = datetime('now') WHERE id = ?")
-        .run(chunkId);
-
-      // Hard-delete associated vectors (no need to keep them)
-      if (ctx.searchContext.vecTextEnabled) {
-        deleteVectorsForChunk(ctx.db, chunkId, '_text');
-      }
-      if (ctx.searchContext.vecCodeEnabled) {
-        deleteVectorsForChunk(ctx.db, chunkId, '_code');
-      }
+      // Soft-delete the chunk (the tombstone stops a re-index bringing it back) and
+      // hard-delete its vectors in every generation, enabled for queries or not.
+      ctx.db.transaction(() => {
+        ctx.db
+          .prepare("UPDATE conv_chunks SET deleted_at = datetime('now') WHERE id = ?")
+          .run(chunkId);
+        deleteVectorsForChunks(ctx.db, [chunkId]);
+      })();
 
       return {
         content: [
@@ -126,12 +128,14 @@ export function registerManageTools(server: McpServer, ctx: ToolContext): void {
       ).cnt;
 
       // Soft delete: hard-delete chunks (clean search), tombstone session row
-      ctx.db.prepare('DELETE FROM conv_chunks WHERE session_id = ?').run(sessionId);
-      ctx.db
-        .prepare(
-          "UPDATE conv_sessions SET deleted_at = datetime('now'), chunk_count = 0 WHERE id = ?",
-        )
-        .run(sessionId);
+      ctx.db.transaction(() => {
+        deleteChunksWhere(ctx.db, 'session_id = ?', [sessionId]);
+        ctx.db
+          .prepare(
+            "UPDATE conv_sessions SET deleted_at = datetime('now'), chunk_count = 0 WHERE id = ?",
+          )
+          .run(sessionId);
+      })();
 
       return {
         content: [

@@ -8,7 +8,14 @@
 
 import net from 'net';
 import fs from 'fs';
-import { openDatabase, setStat, getMeta, recreateVecTables, getVecTableDimensions } from './db.js';
+import {
+  openDatabase,
+  setStat,
+  getMeta,
+  recreateVecTables,
+  getVecTableDimensions,
+  drainPendingVecCleanup,
+} from './db.js';
 import { backfillExistingSessions, detectOrphanedSessions } from './indexer.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { detectRerankerBackend } from './reranker.js';
@@ -286,6 +293,10 @@ if (isMainModule) {
     // Background tasks: backfill + embedding
     setImmediate(async () => {
       try {
+        const drained = drainPendingVecCleanup(db);
+        if (drained > 0)
+          logger.info(P, `Removed ${drained} vectors queued by sqlite-vec-less writers`);
+
         const result = backfillExistingSessions(db, cfg.jsonlDir);
         logger.info(
           P,

@@ -356,3 +356,58 @@ export class FakeReranker implements Reranker {
     return 'fake-reranker';
   }
 }
+
+/** Register a tool group against a stub server and return its handlers by name. */
+export function captureTools(
+  register: (server: never, ctx: never) => void,
+  ctx: unknown,
+): Record<
+  string,
+  (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>
+> {
+  const tools: Record<
+    string,
+    (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>
+  > = {};
+  const server = {
+    registerTool: (name: string, _def: unknown, handler: (typeof tools)[string]) => {
+      tools[name] = handler;
+    },
+  };
+  register(server as never, ctx as never);
+  return tools;
+}
+
+/** Give each chunk a vector in each listed generation (e.g. '_text', '_code', '_text_next'). */
+export function seedVectors(
+  db: Database.Database,
+  suffixes: string[],
+  chunkIds: string[],
+  dims = 384,
+): void {
+  for (const suffix of suffixes) {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS conv_vec${suffix} USING vec0(embedding float[${dims}]);
+      CREATE TABLE IF NOT EXISTS conv_vec_map${suffix} (
+        vec_rowid INTEGER PRIMARY KEY,
+        chunk_id TEXT NOT NULL UNIQUE REFERENCES conv_chunks(id) ON DELETE CASCADE
+      );`);
+    const insV = db.prepare(`INSERT INTO conv_vec${suffix} (embedding) VALUES (?)`);
+    const insM = db.prepare(
+      `INSERT INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`,
+    );
+    for (const id of chunkIds) {
+      const rowid = insV.run(Buffer.from(new Float32Array(dims).fill(0.01).buffer)).lastInsertRowid;
+      insM.run(rowid, id);
+    }
+  }
+}
+
+/** vec0 rows and map rows per generation; equal counts mean no orphans. */
+export function vectorCounts(db: Database.Database, suffix: string): { vec: number; map: number } {
+  const n = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+  return {
+    vec: n(`SELECT COUNT(*) AS n FROM conv_vec${suffix}`),
+    map: n(`SELECT COUNT(*) AS n FROM conv_vec_map${suffix}`),
+  };
+}

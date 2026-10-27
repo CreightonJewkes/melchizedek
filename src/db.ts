@@ -302,20 +302,136 @@ export function insertVectorsBatch(
   insertVectorsBatchToTable(db, items, suffix);
 }
 
-// --- Vector deletion ---
+// --- Deletion: the one path every caller uses ---
+//
+// conv_vec_map* rows cascade away with their chunk, but the vec0 rows they point to do
+// not: a plain chunk DELETE leaves orphan vectors behind. Every chunk or session delete
+// therefore goes through deleteChunksWhere / deleteSessionsWhere, which remove vectors
+// from every generation that exists (text, code, next), enabled or not.
 
-export function deleteVectorsForChunk(
-  db: Database.Database,
-  chunkId: string,
-  suffix = '_text',
-): void {
-  const map = db
-    .prepare(`SELECT vec_rowid FROM conv_vec_map${suffix} WHERE chunk_id = ?`)
-    .get(chunkId) as { vec_rowid: number } | undefined;
-  if (map) {
-    db.prepare(`DELETE FROM conv_vec${suffix} WHERE rowid = ?`).run(map.vec_rowid);
-    db.prepare(`DELETE FROM conv_vec_map${suffix} WHERE chunk_id = ?`).run(chunkId);
+const vecLoaded = new WeakMap<Database.Database, boolean>();
+
+/** True when this connection has sqlite-vec loaded (vec0 tables are usable). */
+export function hasVec(db: Database.Database): boolean {
+  let v = vecLoaded.get(db);
+  if (v === undefined) {
+    try {
+      db.prepare('SELECT vec_version()').get();
+      v = true;
+    } catch {
+      v = false;
+    }
+    vecLoaded.set(db, v);
   }
+  return v;
+}
+
+/** Every vector map table that exists, paired with its vec0 table. */
+export function vectorTables(db: Database.Database): Array<{ map: string; vec: string }> {
+  const names = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'conv\\_vec\\_map%' ESCAPE '\\'",
+    )
+    .pluck()
+    .all() as string[];
+  return names.map((map) => ({ map, vec: 'conv_vec' + map.slice('conv_vec_map'.length) }));
+}
+
+function inTransaction<T>(db: Database.Database, fn: () => T): T {
+  return db.inTransaction ? fn() : db.transaction(fn)();
+}
+
+const ID_BATCH = 500;
+
+/**
+ * Remove the vectors of these chunks from every generation. In a process without
+ * sqlite-vec the vec0 rowids are queued in pending_vec_cleanup (drained by the daemon)
+ * instead of failing. Returns the number of map rows removed.
+ */
+export function deleteVectorsForChunks(db: Database.Database, chunkIds: string[]): number {
+  if (chunkIds.length === 0) return 0;
+  const withVec = hasVec(db);
+  let removed = 0;
+  inTransaction(db, () => {
+    const queue = withVec
+      ? null
+      : db.prepare(
+          'INSERT OR IGNORE INTO pending_vec_cleanup (vec_table, vec_rowid) VALUES (?, ?)',
+        );
+    for (const { map, vec } of vectorTables(db)) {
+      const del = withVec ? db.prepare(`DELETE FROM ${vec} WHERE rowid = ?`) : null;
+      for (let i = 0; i < chunkIds.length; i += ID_BATCH) {
+        const batch = chunkIds.slice(i, i + ID_BATCH);
+        const ph = batch.map(() => '?').join(',');
+        const rowids = db
+          .prepare(`SELECT vec_rowid FROM ${map} WHERE chunk_id IN (${ph})`)
+          .pluck()
+          .all(...batch) as number[];
+        if (rowids.length === 0) continue;
+        for (const rowid of rowids) {
+          if (del) del.run(rowid);
+          else queue!.run(vec, rowid);
+        }
+        db.prepare(`DELETE FROM ${map} WHERE chunk_id IN (${ph})`).run(...batch);
+        removed += rowids.length;
+      }
+    }
+  });
+  return removed;
+}
+
+/** Delete chunks matching a WHERE clause (internal SQL only), with all their vectors. */
+export function deleteChunksWhere(
+  db: Database.Database,
+  where: string,
+  params: unknown[] = [],
+): number {
+  return inTransaction(db, () => {
+    const ids = db
+      .prepare(`SELECT id FROM conv_chunks WHERE ${where}`)
+      .pluck()
+      .all(...params) as string[];
+    deleteVectorsForChunks(db, ids);
+    return db.prepare(`DELETE FROM conv_chunks WHERE ${where}`).run(...params).changes;
+  });
+}
+
+/** Delete sessions matching a WHERE clause, their chunks and all those chunks' vectors. */
+export function deleteSessionsWhere(
+  db: Database.Database,
+  where: string,
+  params: unknown[] = [],
+): { sessions: number; chunks: number } {
+  return inTransaction(db, () => {
+    const chunks = deleteChunksWhere(
+      db,
+      `session_id IN (SELECT id FROM conv_sessions WHERE ${where})`,
+      params,
+    );
+    const sessions = db.prepare(`DELETE FROM conv_sessions WHERE ${where}`).run(...params).changes;
+    return { sessions, chunks };
+  });
+}
+
+/** Apply queued vec0 deletions from processes that could not load sqlite-vec. */
+export function drainPendingVecCleanup(db: Database.Database): number {
+  if (!hasVec(db)) return 0;
+  return inTransaction(db, () => {
+    const rows = db.prepare('SELECT vec_table, vec_rowid FROM pending_vec_cleanup').all() as Array<{
+      vec_table: string;
+      vec_rowid: number;
+    }>;
+    const existing = new Set(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").pluck().all() as string[],
+    );
+    for (const r of rows) {
+      if (existing.has(r.vec_table)) {
+        db.prepare(`DELETE FROM ${r.vec_table} WHERE rowid = ?`).run(r.vec_rowid);
+      }
+    }
+    db.prepare('DELETE FROM pending_vec_cleanup').run();
+    return rows.length;
+  });
 }
 
 /**
@@ -480,22 +596,8 @@ export interface PurgeResult {
 }
 
 export function purgeProjectData(db: Database.Database, project: string): PurgeResult {
-  // Count chunks before deletion
-  const chunkCount = (
-    db
-      .prepare(
-        'SELECT COUNT(*) AS cnt FROM conv_chunks WHERE session_id IN (SELECT id FROM conv_sessions WHERE project = ?)',
-      )
-      .get(project) as { cnt: number }
-  ).cnt;
-
-  // Delete sessions — chunks cascade via FK ON DELETE CASCADE
-  const result = db.prepare('DELETE FROM conv_sessions WHERE project = ?').run(project);
-
-  return {
-    sessionsPurged: result.changes,
-    chunksPurged: chunkCount,
-  };
+  const { sessions, chunks } = deleteSessionsWhere(db, 'project = ?', [project]);
+  return { sessionsPurged: sessions, chunksPurged: chunks };
 }
 
 export function closeDatabase(db: Database.Database): void {
