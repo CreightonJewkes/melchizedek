@@ -4,7 +4,7 @@
  *
  * Usage:
  *   tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir> [--set main|hard|errors|files]
- *                        [--model <registry key>] [--no-rerank] [--limit 10]
+ *                        [--model <registry key>] [--no-rerank] [--limit 10] [--max-per-session N]
  *
  * Model files are read from M9K_MODEL_CACHE (a transformers.js cache dir) when set; remote downloads
  * stay off. Boosts are neutral (no currentProject / currentSession). Nothing here writes to the DB
@@ -53,6 +53,7 @@ const outDir = arg('out')!;
 const set = arg('set', 'main')!;
 const modelKey = arg('model', DEFAULT_TEXT_MODEL_KEY)!;
 const LIMIT = parseInt(arg('limit', '10')!, 10);
+const MAX_PER_SESSION = arg('max-per-session') ? parseInt(arg('max-per-session')!, 10) : undefined;
 if (!dbPath || !queriesPath || !outDir) {
   console.error('usage: tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir>');
   process.exit(2);
@@ -180,7 +181,7 @@ async function main(): Promise<void> {
       runs.bm25 = ids(applyFilters(bm25raw, o)).slice(0, LIMIT);
       runs.vector = ids(applyFilters(vecraw, o)).slice(0, LIMIT);
       runs.fuzzy = ids(applyFilters(fuzzyraw, o)).slice(0, LIMIT);
-      const opts = { query: q.query, limit: LIMIT, ...o };
+      const opts = { query: q.query, limit: LIMIT, ...o, maxPerSession: MAX_PER_SESSION };
       runs.full_norerank = ids(await S.search(db, opts, baseCtx));
       const t0 = performance.now();
       const full = await S.search(db, opts, fullCtx);

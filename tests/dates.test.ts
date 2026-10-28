@@ -110,7 +110,12 @@ describe('date handling in the tools (A5)', () => {
     const recent = parse(
       await tools['m9k_search']({ query: 'cors express', limit: 10, since: '3 days ago' }),
     );
-    expect(recent.map((r) => r.chunkId).sort()).toEqual(['sess-copy:0', 'sess-live:0']);
+    // Both sessions are in range; their identical exchange collapses to one result (A6).
+    expect(recent).toHaveLength(1);
+    expect(['sess-copy', 'sess-live']).toContain(recent[0].sessionId);
+    expect(recent[0].alsoIn).toEqual([
+      recent[0].sessionId === 'sess-live' ? 'sess-copy' : 'sess-live',
+    ]);
 
     const similar = parse(
       await tools['m9k_similar_work']({

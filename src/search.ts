@@ -308,6 +308,46 @@ export function fusionRRF(lists: SearchResult[][], k = RRF_K): SearchResult[] {
 const PROJECT_BOOST_FACTOR = 1.5;
 const SESSION_BOOST_FACTOR = 1.2;
 
+/**
+ * Collapse results whose exchange text is identical (same hash), keeping the best-ranked
+ * copy and recording the other sessions on it, so copies do not crowd out distinct hits.
+ */
+function dedupeByHash(db: Database.Database, results: SearchResult[]): SearchResult[] {
+  if (results.length < 2) return results;
+  const hashes = new Map<string, string>();
+  for (let i = 0; i < results.length; i += 500) {
+    const ids = results.slice(i, i + 500).map((r) => r.chunkId);
+    const rows = db
+      .prepare(`SELECT id, hash FROM conv_chunks WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .all(...ids) as Array<{ id: string; hash: string }>;
+    for (const row of rows) hashes.set(row.id, row.hash);
+  }
+  const kept = new Map<string, SearchResult>();
+  const out: SearchResult[] = [];
+  for (const r of results) {
+    const h = hashes.get(r.chunkId);
+    const first = h ? kept.get(h) : undefined;
+    if (!first) {
+      if (h) kept.set(h, r);
+      out.push(r);
+    } else if (r.sessionId !== first.sessionId && !first.alsoIn?.includes(r.sessionId)) {
+      (first.alsoIn ??= []).push(r.sessionId);
+    }
+  }
+  return out;
+}
+
+/** At most `max` results per session, in order; later results refill the freed slots. */
+function capPerSession(results: SearchResult[], max?: number): SearchResult[] {
+  if (!max || max < 1) return results;
+  const perSession = new Map<string, number>();
+  return results.filter((r) => {
+    const n = perSession.get(r.sessionId) ?? 0;
+    perSession.set(r.sessionId, n + 1);
+    return n < max;
+  });
+}
+
 /** Fused candidates the cross-encoder scores per search (serially, in q8), whatever the limit. */
 export const RERANK_POOL = 20;
 
@@ -401,6 +441,9 @@ export async function search(
     }
   }
 
+  // Copies of one exchange (sessions resumed or forked from another) take one slot.
+  results = dedupeByHash(db, results);
+
   // Reranker: the cross-encoder reorders only the top RERANK_POOL fused candidates (its
   // cost grows with the pool, not with the output limit); the rest keep fused order
   // behind them. Logits become rank scores on the RRF scale, so later multipliers stay
@@ -455,7 +498,7 @@ export async function search(
     results.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   }
 
-  const finalResults = results.slice(0, options.limit);
+  const finalResults = capPerSession(results, options.maxPerSession).slice(0, options.limit);
 
   // Update usage counters (best-effort, don't fail the search)
   try {

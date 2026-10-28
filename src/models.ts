@@ -53,6 +53,8 @@ export interface SearchResult {
   timestamp: string;
   matchType: MatchType;
   sessionId: string;
+  /** Other sessions holding an identical copy of this exchange (collapsed into this one). */
+  alsoIn?: string[];
 }
 
 export type SearchOrder = 'score' | 'date_asc' | 'date_desc';
@@ -66,6 +68,8 @@ export interface SearchOptions {
   since?: string;
   until?: string;
   order?: SearchOrder;
+  /** Keep at most this many results per session, refilling from lower ranks (off when unset). */
+  maxPerSession?: number;
 }
 
 // --- Search context ---
