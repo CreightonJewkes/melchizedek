@@ -6,7 +6,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { search } from '../search.js';
 import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
-import type { ToolContext } from './context.js';
+import { SOURCE_PARAM, type ToolContext } from './context.js';
 
 export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -43,10 +43,7 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           .describe(
             'Sort order: score (relevance), date_asc (oldest first), date_desc (newest first)',
           ),
-        source: z
-          .enum(['conversations', 'git', 'files'])
-          .optional()
-          .describe('Filter by source type. Default: all sources.'),
+        source: SOURCE_PARAM,
       },
       annotations: {
         readOnlyHint: true,

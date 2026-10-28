@@ -17,7 +17,7 @@ import {
 import { detectRerankerBackend } from '../reranker.js';
 import { writeConfigFile } from '../config.js';
 import type { MelchizedekConfig, EmbedJobStatus } from '../models.js';
-import type { ToolContext } from './context.js';
+import { SOURCE_PARAM, type ToolContext } from './context.js';
 import { CONV_KIND_MEMORY } from '../constants.js';
 import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 
@@ -147,10 +147,7 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
           .describe(
             "Named date range in local time, e.g. 'today', 'yesterday', 'last week', 'this month', 'past 3 days', '2 hours ago' (one hour either side). since/until override its sides.",
           ),
-        source: z
-          .enum(['conversations', 'git', 'files'])
-          .optional()
-          .describe('Filter by source type. Default: all sources.'),
+        source: SOURCE_PARAM,
       },
       annotations: {
         readOnlyHint: true,

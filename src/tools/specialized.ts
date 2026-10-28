@@ -8,7 +8,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type Database from 'better-sqlite3';
 import { search, searchBM25 } from '../search.js';
 import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
-import type { ToolContext } from './context.js';
+import { SOURCE_PARAM, type ToolContext } from './context.js';
 
 export function registerSpecializedTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
@@ -19,10 +19,7 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       inputSchema: {
         filePath: z.string().describe('File path to search for (e.g. "src/server.ts")'),
         limit: z.number().int().min(1).max(50).default(10).describe('Max results'),
-        source: z
-          .enum(['conversations', 'git', 'files'])
-          .optional()
-          .describe('Filter by source type. Default: all sources.'),
+        source: SOURCE_PARAM,
       },
       annotations: {
         readOnlyHint: true,
@@ -46,10 +43,7 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       inputSchema: {
         errorMessage: z.string().describe('The error message or keywords from the error'),
         limit: z.number().int().min(1).max(20).default(5).describe('Max results'),
-        source: z
-          .enum(['conversations', 'git', 'files'])
-          .optional()
-          .describe('Filter by source type. Default: all sources.'),
+        source: SOURCE_PARAM,
       },
       annotations: {
         readOnlyHint: true,
@@ -128,10 +122,7 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
           .describe(
             "Named date range in local time, e.g. 'today', 'yesterday', 'last week', 'this month', 'past 3 days', '2 hours ago' (one hour either side). since/until override its sides.",
           ),
-        source: z
-          .enum(['conversations', 'git', 'files'])
-          .optional()
-          .describe('Filter by source type. Default: all sources.'),
+        source: SOURCE_PARAM,
       },
       annotations: {
         readOnlyHint: true,

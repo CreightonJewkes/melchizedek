@@ -967,37 +967,26 @@ describe('MCP server', () => {
     expect(data.length).toBeGreaterThan(0);
   });
 
-  it('search tools should accept optional source parameter without error', async () => {
-    // V1: source is accepted but ignored (all data is conversations)
-    const searchResult = await client.callTool({
-      name: 'm9k_search',
-      arguments: { query: 'CORS', source: 'conversations' },
-    });
-    expect(searchResult.isError).toBeFalsy();
-
-    const sessionsResult = await client.callTool({
-      name: 'm9k_sessions',
-      arguments: { source: 'git' },
-    });
-    expect(sessionsResult.isError).toBeFalsy();
-
-    const fileResult = await client.callTool({
-      name: 'm9k_file_history',
-      arguments: { filePath: 'src/server.ts', source: 'files' },
-    });
-    expect(fileResult.isError).toBeFalsy();
-
-    const errorsResult = await client.callTool({
-      name: 'm9k_errors',
-      arguments: { errorMessage: 'CORS', source: 'conversations' },
-    });
-    expect(errorsResult.isError).toBeFalsy();
-
-    const similarResult = await client.callTool({
-      name: 'm9k_similar_work',
-      arguments: { description: 'fix CORS', source: 'conversations' },
-    });
-    expect(similarResult.isError).toBeFalsy();
+  it("search tools accept source 'conversations' and reject the unsupported values (C2)", async () => {
+    // Conversations are the only indexed source; 'git' and 'files' used to be accepted and ignored.
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ['m9k_search', { query: 'CORS' }],
+      ['m9k_sessions', {}],
+      ['m9k_file_history', { filePath: 'src/server.ts' }],
+      ['m9k_errors', { errorMessage: 'CORS' }],
+      ['m9k_similar_work', { description: 'fix CORS' }],
+    ];
+    const call = (name: string, args: Record<string, unknown>) =>
+      client
+        .callTool({ name, arguments: args })
+        .then((r) => !!r.isError)
+        .catch(() => true);
+    for (const [name, args] of calls) {
+      expect(await call(name, { ...args, source: 'conversations' }), name).toBe(false);
+      expect(await call(name, args), name).toBe(false);
+      expect(await call(name, { ...args, source: 'git' }), name).toBe(true);
+      expect(await call(name, { ...args, source: 'files' }), name).toBe(true);
+    }
   });
 });
 
