@@ -16,6 +16,8 @@ export interface ToolContext {
   cfg: MelchizedekConfig;
   searchContext: SearchContext;
   currentProject?: string;
+  /** The calling Claude Code session (per connection), for the session boost. */
+  currentSession?: string;
   orchestrator: EmbedOrchestrator | null;
   embeddingState: EmbeddingState;
   version: string;

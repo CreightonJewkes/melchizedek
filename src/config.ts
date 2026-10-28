@@ -71,6 +71,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
     rerankerModelsDir: DEFAULT_MODELS_DIR,
     rerankerUrl: null,
     autoFuzzyThreshold: 3,
+    projectBoost: 1,
     logLevel: 'warn',
   };
 
@@ -100,6 +101,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
   if (process.env.M9K_RERANKER_URL) env.rerankerUrl = process.env.M9K_RERANKER_URL;
   if (process.env.M9K_AUTO_FUZZY_THRESHOLD)
     env.autoFuzzyThreshold = parseInt(process.env.M9K_AUTO_FUZZY_THRESHOLD, 10);
+  if (process.env.M9K_PROJECT_BOOST) env.projectBoost = parseFloat(process.env.M9K_PROJECT_BOOST);
   if (process.env.M9K_LOG_LEVEL)
     env.logLevel = process.env.M9K_LOG_LEVEL as MelchizedekConfig['logLevel'];
 

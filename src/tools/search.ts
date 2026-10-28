@@ -4,7 +4,6 @@
 
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { getStat } from '../db.js';
 import { search } from '../search.js';
 import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 import type { ToolContext } from './context.js';
@@ -64,14 +63,14 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
         if (err instanceof DateInputError) return dateErrorResult(err);
         throw err;
       }
-      const currentSession = getStat(ctx.db, 'current_session_id') || undefined;
       const results = await search(
         ctx.db,
         {
           query,
           project,
           currentProject: ctx.currentProject,
-          currentSession,
+          currentSession: ctx.currentSession,
+          projectBoost: ctx.cfg.projectBoost,
           limit,
           since: range.since,
           until: range.until,

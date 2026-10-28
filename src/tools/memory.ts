@@ -36,6 +36,7 @@ const CONFIGURABLE_KEYS = new Set([
   'rerankerModel',
   'rerankerUrl',
   'autoFuzzyThreshold',
+  'projectBoost',
   'logLevel',
 ]);
 

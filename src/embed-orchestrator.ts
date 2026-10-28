@@ -36,7 +36,7 @@ export class EmbedOrchestrator {
     rssMB: null,
     heapUsedMB: null,
   };
-  private onStatusChangeCb?: (status: EmbedJobStatus) => void;
+  private statusListeners = new Set<(status: EmbedJobStatus) => void>();
   private busy = false;
   private lastError: { message: string; at: string } | null = null;
   private readonly noProgressMs: number;
@@ -61,8 +61,10 @@ export class EmbedOrchestrator {
     return { ...this.status };
   }
 
-  onStatusChange(cb: (status: EmbedJobStatus) => void): void {
-    this.onStatusChangeCb = cb;
+  /** Subscribe to status changes (one listener per connection); returns the unsubscribe. */
+  onStatusChange(cb: (status: EmbedJobStatus) => void): () => void {
+    this.statusListeners.add(cb);
+    return () => this.statusListeners.delete(cb);
   }
 
   /** True while an embed job or maintenance task holds the single flight. */
@@ -357,6 +359,7 @@ export class EmbedOrchestrator {
   }
 
   private notifyStatusChange(): void {
-    this.onStatusChangeCb?.(this.getStatus());
+    const status = this.getStatus();
+    for (const cb of this.statusListeners) cb(status);
   }
 }

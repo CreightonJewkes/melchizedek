@@ -23,7 +23,7 @@ import { getConfig } from './config.js';
 import { EmbedOrchestrator } from './embed-orchestrator.js';
 import { reconcileVecTables } from './migration.js';
 import { SocketTransport } from './socket-transport.js';
-import { createServer } from './server.js';
+import { createServer, knownSessionId } from './server.js';
 import { initLogger, logger } from './logger.js';
 import type { Embedder, Reranker, SearchContext } from './models.js';
 import {
@@ -37,7 +37,7 @@ import {
 interface RegisterMessage {
   type: 'register';
   project: string;
-  sessionId: string;
+  sessionId?: string;
 }
 
 const P = 'daemon';
@@ -186,21 +186,20 @@ if (isMainModule) {
           // Remove our 'data' listener — SocketTransport will take over
           clientSocket.removeAllListeners('data');
 
-          // Create per-connection McpServer with shared resources
+          // Per-connection McpServer: its own project and session, the shared search context
+          // (so the code embedder, loaded later, reaches every connection) and orchestrator.
           const { server, setEmbeddingInProgress } = createServer(cfg, db, {
-            embedderText,
-            embedderCode: searchContext.embedderCode,
-            reranker,
-            vecTextEnabled: vecEnabled,
-            vecCodeEnabled: searchContext.vecCodeEnabled,
+            searchContext,
             currentProject: msg.project,
+            currentSession: knownSessionId(msg.sessionId),
             orchestrator: orch,
             mode: 'daemon',
           });
 
-          orch.onStatusChange((status) => {
+          const unsubscribe = orch.onStatusChange((status) => {
             setEmbeddingInProgress(status.active);
           });
+          clientSocket.once('close', unsubscribe);
 
           const transport = new SocketTransport(clientSocket);
           await server.connect(transport);

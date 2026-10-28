@@ -842,7 +842,7 @@ describe('MCP server', () => {
 
   // --- current project boost ---
 
-  it('m9k_search should boost current project results when server has currentProject', async () => {
+  it('m9k_search should boost current project results when projectBoost is set', async () => {
     // Add a second session in a different project with similar content
     db.prepare(
       `INSERT INTO conv_sessions (id, project, jsonl_path, started_at, message_count, chunk_count)
@@ -863,7 +863,10 @@ describe('MCP server', () => {
     );
 
     // Create a new server with currentProject set to the fixture's project
-    const result2 = createServer({}, db, { currentProject: '/Users/test/my-project' });
+    // projectBoost is off by default (D22); 1.5 restores the earlier releases' ranking
+    const result2 = createServer({ projectBoost: 1.5 }, db, {
+      currentProject: '/Users/test/my-project',
+    });
     const client2 = new Client({ name: 'boost-test', version: '1.0.0' });
     const [ct2, st2] = InMemoryTransport.createLinkedPair();
     await Promise.all([result2.server.connect(st2), client2.connect(ct2)]);

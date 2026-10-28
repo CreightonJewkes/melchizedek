@@ -70,6 +70,8 @@ export interface SearchOptions {
   since?: string;
   until?: string;
   order?: SearchOrder;
+  /** Multiplier for results from currentProject (default 1: no project boost). */
+  projectBoost?: number;
   /** Keep at most this many results per session, refilling from lower ranks (off when unset). */
   maxPerSession?: number;
 }
@@ -145,6 +147,11 @@ export interface MelchizedekConfig {
   rerankerModelsDir: string;
   rerankerUrl: string | null;
   autoFuzzyThreshold: number;
+  /**
+   * Score multiplier for results from the caller's own project (1 = off). 1.5 restores the
+   * ranking of earlier releases; off by default here, since it outranked better matches.
+   */
+  projectBoost: number;
   logLevel: LogLevel;
 }
 

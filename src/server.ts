@@ -52,6 +52,9 @@ export function createServer(
     vecTextEnabled?: boolean;
     vecCodeEnabled?: boolean;
     currentProject?: string;
+    currentSession?: string;
+    /** One shared object for every connection, so a late-loading embedder reaches all. */
+    searchContext?: SearchContext;
     orchestrator?: EmbedOrchestrator | null;
     mode?: 'daemon' | 'local';
   },
@@ -89,7 +92,7 @@ export function createServer(
   let embeddingInProgress = false;
   const orchestrator = options?.orchestrator ?? null;
 
-  const searchContext: SearchContext = {
+  const searchContext: SearchContext = options?.searchContext ?? {
     embedderText,
     embedderCode,
     reranker,
@@ -108,6 +111,7 @@ export function createServer(
     cfg,
     searchContext,
     currentProject,
+    currentSession: options?.currentSession,
     orchestrator,
     embeddingState: {
       get: () => embeddingInProgress,
@@ -176,14 +180,23 @@ async function waitForSocket(timeoutMs = 15000): Promise<void> {
   throw new Error('Daemon startup timeout');
 }
 
+/** A session id the caller can be boosted by: absent, empty and 'unknown' mean none. */
+export function knownSessionId(id: string | undefined): string | undefined {
+  return id && id !== 'unknown' ? id : undefined;
+}
+
+/** The calling session: Claude Code gives MCP servers CLAUDE_CODE_SESSION_ID. */
+export function sessionIdFromEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return knownSessionId(env.CLAUDE_CODE_SESSION_ID) ?? knownSessionId(env.SESSION_ID);
+}
+
+/** The proxy's first line to the daemon. */
+export function registerMessage(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  return JSON.stringify({ type: 'register', project: cwd, sessionId: sessionIdFromEnv(env) });
+}
+
 async function runProxyMode(sock: net.Socket): Promise<void> {
-  // Send register message
-  const registerMsg = JSON.stringify({
-    type: 'register',
-    project: process.cwd(),
-    sessionId: process.env.SESSION_ID ?? 'unknown',
-  });
-  sock.write(registerMsg + '\n');
+  sock.write(registerMessage(process.cwd()) + '\n');
 
   // Wait for registered response
   await new Promise<void>((resolve, reject) => {
@@ -277,6 +290,7 @@ async function runLocalMode(): Promise<void> {
     vecTextEnabled: vecEnabled,
     vecCodeEnabled: false,
     currentProject: process.cwd(),
+    currentSession: sessionIdFromEnv(),
     orchestrator: orch,
   });
 

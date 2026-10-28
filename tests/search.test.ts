@@ -920,6 +920,7 @@ describe('current project boost', () => {
       query: 'CORS',
       limit: 10,
       currentProject: '/current/project',
+      projectBoost: 1.5, // off by default since D22; 1.5 is the earlier releases' ranking
     });
 
     expect(results.length).toBe(2);
@@ -939,6 +940,17 @@ describe('current project boost', () => {
     expect(results.every((r) => r.project === '/other/project')).toBe(true);
   });
 
+  it('with the default project boost (1), the caller project changes nothing (D22)', async () => {
+    const plain = await search(db, { query: 'CORS', limit: 10 });
+    const fromProject = await search(db, {
+      query: 'CORS',
+      limit: 10,
+      currentProject: '/current/project',
+    });
+    expect(fromProject.map((r) => r.chunkId)).toEqual(plain.map((r) => r.chunkId));
+    expect(fromProject[0].project).toBe('/other/project'); // the better match stays first
+  });
+
   it('should still include cross-project results', async () => {
     const results = await search(db, {
       query: 'CORS',
@@ -952,11 +964,12 @@ describe('current project boost', () => {
   });
 
   it('should not boost when currentProject is not set', async () => {
-    const withoutBoost = await search(db, { query: 'CORS', limit: 10 });
+    const withoutBoost = await search(db, { query: 'CORS', limit: 10, projectBoost: 1.5 });
     const withBoost = await search(db, {
       query: 'CORS',
       limit: 10,
       currentProject: '/current/project',
+      projectBoost: 1.5,
     });
 
     // Without boost, order is pure BM25. With boost, current project is promoted.

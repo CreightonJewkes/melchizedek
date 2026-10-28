@@ -317,11 +317,10 @@ export function fusionRRF(lists: SearchResult[][], k = RRF_K): SearchResult[] {
 }
 
 /**
- * Project boost factor: results from currentProject get a score boost.
- * Applied as a multiplier on the fused (or reranked rank) score, which is always positive.
- * Moderate enough to promote same-project results without hiding cross-project ones.
+ * Affinity boosts multiply the fused (or reranked rank) score, which is always positive.
+ * The project boost comes from config (projectBoost, default 1: off); the session boost
+ * applies when the caller's own session is known.
  */
-const PROJECT_BOOST_FACTOR = 1.5;
 const SESSION_BOOST_FACTOR = 1.2;
 
 /**
@@ -513,7 +512,7 @@ export async function search(
   logger.debug('search', ` reranker: ${(performance.now() - tRerank0).toFixed(0)}ms`);
 
   // Affinity boosts multiply the (positive) fused or rank score, before the final cut.
-  const projectBoost = !options.project && options.currentProject ? PROJECT_BOOST_FACTOR : 1;
+  const projectBoost = !options.project && options.currentProject ? (options.projectBoost ?? 1) : 1;
   const sessionBoost = options.currentSession ? SESSION_BOOST_FACTOR : 1;
   if (!chronological && (projectBoost !== 1 || sessionBoost !== 1)) {
     for (const r of results) {
