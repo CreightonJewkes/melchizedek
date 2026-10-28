@@ -503,6 +503,7 @@ export function deleteVectorsForChunks(db: Database.Database, chunkIds: string[]
           if (del) del.run(rowid);
           else queue!.run(vec, rowid);
         }
+        if (del) countDeadVectors(db, vec, rowids.length);
         db.prepare(`DELETE FROM ${map} WHERE chunk_id IN (${ph})`).run(...batch);
         removed += rowids.length;
       }
@@ -558,11 +559,145 @@ export function drainPendingVecCleanup(db: Database.Database): number {
     for (const r of rows) {
       if (existing.has(r.vec_table)) {
         db.prepare(`DELETE FROM ${r.vec_table} WHERE rowid = ?`).run(r.vec_rowid);
+        countDeadVectors(db, r.vec_table, 1);
       }
     }
     db.prepare('DELETE FROM pending_vec_cleanup').run();
     return rows.length;
   });
+}
+
+// --- Orphan sweep and compaction (B2b) ---
+
+/**
+ * vec0 never frees or reuses the slot of a deleted row, and a scan still reads it, so
+ * deletions are counted per table (count(*) only sees live rows) to decide on compaction.
+ */
+function countDeadVectors(db: Database.Database, vecTable: string, n: number): void {
+  if (n <= 0) return;
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)`,
+  ).run(`vec_dead_rows:${vecTable}`, String(n));
+}
+
+export interface SweepResult {
+  /** vec0 rows no map row pointed to. */
+  orphanVectors: number;
+  /** Map rows pointing to no vector, or to a missing or forgotten chunk. */
+  danglingMaps: number;
+  /** Generations left alone because a migration is in progress. */
+  skipped: string[];
+}
+
+/**
+ * Remove orphan vectors and dangling map rows from every generation, in batches of short
+ * transactions so hooks are never blocked for long. A generation whose model migration is
+ * in progress is skipped. Run it only when no embed job is running (the orchestrator's
+ * single flight): a worker's insert could otherwise be swept between its two writes.
+ */
+export function sweepOrphanVectors(db: Database.Database, batch = 2_000): SweepResult {
+  const result: SweepResult = { orphanVectors: 0, danglingMaps: 0, skipped: [] };
+  if (!hasVec(db)) return result;
+  for (const { map, vec } of vectorTables(db)) {
+    const base = vec.slice('conv_vec'.length).replace(/_next$/, '');
+    if (getMeta(db, `migration_target_model${base}`) !== null) {
+      result.skipped.push(vec);
+      continue;
+    }
+    const drain = (select: string, apply: (rowids: number[]) => void): number => {
+      let total = 0;
+      for (;;) {
+        const n = db
+          .transaction(() => {
+            const rowids = db.prepare(select).pluck().all(batch) as number[];
+            if (rowids.length > 0) apply(rowids);
+            return rowids.length;
+          })
+          .immediate();
+        total += n;
+        if (n < batch) return total;
+      }
+    };
+    const delVec = db.prepare(`DELETE FROM ${vec} WHERE rowid = ?`);
+    const delMap = db.prepare(`DELETE FROM ${map} WHERE vec_rowid = ?`);
+    result.danglingMaps += drain(
+      `SELECT m.vec_rowid FROM ${map} m LEFT JOIN conv_chunks c ON c.id = m.chunk_id
+       WHERE c.id IS NULL OR c.deleted_at IS NOT NULL LIMIT ?`,
+      (rowids) => {
+        for (const r of rowids) {
+          countDeadVectors(db, vec, delVec.run(r).changes);
+          delMap.run(r);
+        }
+      },
+    );
+    result.danglingMaps += drain(
+      `SELECT vec_rowid FROM ${map} WHERE vec_rowid NOT IN (SELECT rowid FROM ${vec}) LIMIT ?`,
+      (rowids) => {
+        for (const r of rowids) delMap.run(r);
+      },
+    );
+    result.orphanVectors += drain(
+      `SELECT rowid FROM ${vec} WHERE rowid NOT IN (SELECT vec_rowid FROM ${map}) LIMIT ?`,
+      (rowids) => {
+        for (const r of rowids) delVec.run(r);
+        countDeadVectors(db, vec, rowids.length);
+      },
+    );
+  }
+  return result;
+}
+
+/** Share of a vec0 table's slots that hold deleted rows (see countDeadVectors). */
+export function deadVectorShare(db: Database.Database, vecTable: string): number {
+  const dead = parseInt(getMeta(db, `vec_dead_rows:${vecTable}`) ?? '0', 10);
+  const live = (db.prepare(`SELECT COUNT(*) AS n FROM ${vecTable}`).get() as { n: number }).n;
+  return dead + live === 0 ? 0 : dead / (dead + live);
+}
+
+/** Compact a generation once more than this share of its slots is dead. */
+export const COMPACT_DEAD_SHARE = 0.5;
+
+/**
+ * Rewrite a vec0 table with only its mapped rows, rowids kept so the map stays valid. Like
+ * the migration swap, it is one IMMEDIATE transaction (sqlite-vec >= 0.1.9 runs vec0 DDL
+ * inside one), so a failure leaves the old table as it was. Returns the rows kept.
+ */
+export function compactVectors(db: Database.Database, suffix: string): number {
+  const vec = `conv_vec${suffix}`;
+  const map = `conv_vec_map${suffix}`;
+  const dims = getVecTableDimensions(db, suffix);
+  if (dims === null) return 0;
+  return db
+    .transaction(() => {
+      db.exec(`
+        DROP TABLE IF EXISTS ${vec}_compact;
+        CREATE VIRTUAL TABLE ${vec}_compact USING vec0(embedding float[${dims}]);
+        INSERT INTO ${vec}_compact(rowid, embedding)
+          SELECT v.rowid, v.embedding FROM ${map} m JOIN ${vec} v ON v.rowid = m.vec_rowid;
+        DROP TABLE ${vec};
+        CREATE VIRTUAL TABLE ${vec} USING vec0(embedding float[${dims}]);
+        INSERT INTO ${vec}(rowid, embedding) SELECT rowid, embedding FROM ${vec}_compact;
+        DROP TABLE ${vec}_compact;
+      `);
+      deleteMeta(db, `vec_dead_rows:${vec}`);
+      return (db.prepare(`SELECT COUNT(*) AS n FROM ${vec}`).get() as { n: number }).n;
+    })
+    .immediate();
+}
+
+/** Daemon maintenance: sweep every generation, then compact those mostly made of dead slots. */
+export function maintainVectors(db: Database.Database): SweepResult & { compacted: string[] } {
+  const swept = sweepOrphanVectors(db);
+  const compacted: string[] = [];
+  for (const { vec } of vectorTables(db)) {
+    if (swept.skipped.includes(vec)) continue;
+    if (deadVectorShare(db, vec) > COMPACT_DEAD_SHARE) {
+      compactVectors(db, vec.slice('conv_vec'.length));
+      compacted.push(vec);
+    }
+  }
+  return { ...swept, compacted };
 }
 
 /**
