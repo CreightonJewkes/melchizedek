@@ -655,6 +655,47 @@ export function deadVectorShare(db: Database.Database, vecTable: string): number
   return dead + live === 0 ? 0 : dead / (dead + live);
 }
 
+export interface VectorTableHealth {
+  table: string;
+  /** vec0 rows. */
+  vectors: number;
+  /** Map rows (chunks with a vector). */
+  mapped: number;
+  orphanVectors: number;
+  danglingMaps: number;
+  /** Share of slots that hold deleted rows (vec0 keeps them until compaction). */
+  deadSlotShare: number;
+}
+
+/** Per vector generation, from row counts and rowid joins only (no vector bytes are read). */
+export function vectorHealth(db: Database.Database): VectorTableHealth[] {
+  if (!hasVec(db)) return [];
+  const n = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+  return vectorTables(db).flatMap(({ map, vec }) => {
+    try {
+      return [
+        {
+          table: vec,
+          vectors: n(`SELECT COUNT(*) AS n FROM ${vec}`),
+          mapped: n(`SELECT COUNT(*) AS n FROM ${map}`),
+          orphanVectors: n(
+            `SELECT COUNT(*) AS n FROM ${vec} WHERE rowid NOT IN (SELECT vec_rowid FROM ${map})`,
+          ),
+          danglingMaps:
+            n(
+              `SELECT COUNT(*) AS n FROM ${map} m LEFT JOIN conv_chunks c ON c.id = m.chunk_id
+               WHERE c.id IS NULL OR c.deleted_at IS NOT NULL`,
+            ) +
+            n(`SELECT COUNT(*) AS n FROM ${map} WHERE vec_rowid NOT IN (SELECT rowid FROM ${vec})`),
+          deadSlotShare: +deadVectorShare(db, vec).toFixed(3),
+        },
+      ];
+    } catch {
+      return []; // a half-created generation
+    }
+  });
+}
+
 /** Compact a generation once more than this share of its slots is dead. */
 export const COMPACT_DEAD_SHARE = 0.5;
 

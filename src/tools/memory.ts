@@ -13,7 +13,11 @@ import {
   countEligibleChunks,
   countEmbeddedChunks,
   getIgnoredProjects,
+  oldestPendingEmbedding,
+  vectorHealth,
 } from '../db.js';
+import { ftsErrorCounts } from '../search.js';
+import { embedderRecipe, vectorIndexMatches } from '../migration.js';
 import { detectRerankerBackend } from '../reranker.js';
 import { writeConfigFile } from '../config.js';
 import type { MelchizedekConfig, EmbedJobStatus } from '../models.js';
@@ -377,13 +381,58 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
         };
       }
 
+      // --- Index health: what a healthy-looking status used to hide ---
+      const vectors = vectorHealth(ctx.db);
+      const pendingSince = oldestPendingEmbedding(ctx.db, '_text');
+      const pendingMinutes = pendingSince
+        ? Math.max(0, Math.round((Date.now() - Date.parse(pendingSince)) / 60_000))
+        : null;
+      const embedder = ctx.searchContext.embedderText;
+      const textVectors = !embedder
+        ? 'disabled'
+        : hasMigrationText
+          ? 'skipped: migration in progress'
+          : vectorIndexMatches(ctx.db, embedder, '_text')
+            ? 'active'
+            : 'skipped: index built by another model or recipe';
+      const lastJobError = ctx.orchestrator?.getLastError() ?? null;
+      const warnings: string[] = [];
+      for (const v of vectors) {
+        if (v.orphanVectors > 0.1 * v.vectors) {
+          warnings.push(`${v.table}: ${v.orphanVectors} of ${v.vectors} vectors are orphans`);
+        }
+        if (v.danglingMaps > 0) warnings.push(`${v.table}: ${v.danglingMaps} dangling map rows`);
+        if (v.deadSlotShare > 0.5) {
+          warnings.push(`${v.table}: ${Math.round(v.deadSlotShare * 100)}% of slots are dead`);
+        }
+      }
+      if (pendingMinutes !== null && pendingMinutes > 60) {
+        warnings.push(`the oldest chunk without a vector has waited ${pendingMinutes} min`);
+      }
+      if (textVectors.startsWith('skipped: index')) warnings.push(`text vectors ${textVectors}`);
+      if (lastJobError) warnings.push(`last embed job failed: ${lastJobError.message}`);
+      const health = {
+        vectors,
+        pending: {
+          unembedded: Math.max(0, eligibleChunks - embeddedChunksText),
+          oldestSince: pendingSince,
+          oldestMinutes: pendingMinutes,
+        },
+        textVectors,
+        loadedModel: embedder ? { id: embedder.modelId(), recipe: embedderRecipe(embedder) } : null,
+        indexRecipe: getMeta(ctx.db, 'embedding_recipe_text'),
+        lastJobError,
+        keywordErrors: { ...ftsErrorCounts },
+        warnings,
+      };
+
       // --- Status emoji ---
       let status: string;
       if (!ctx.cfg.embeddingsEnabled) {
         status = '\u{1F7E2} bm25-only';
       } else if (workerStatus.active) {
         status = '\u{1F535} embedding';
-      } else if (activity?.type === 'stuck-migration') {
+      } else if (activity?.type === 'stuck-migration' || warnings.length > 0) {
         status = '\u{1F7E0} degraded';
       } else {
         status = '\u{1F7E2} healthy';
@@ -436,6 +485,7 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
                 reranker: rerankerLine,
               },
               activity,
+              health,
               usage: {
                 searches: searchCount,
                 hits: hitCount,
