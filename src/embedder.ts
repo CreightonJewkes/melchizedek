@@ -77,7 +77,9 @@ export class TransformersJsEmbedder implements Embedder {
   }
 
   async embedQuery(text: string): Promise<Float32Array> {
-    const prefixed = this.spec.queryPrefix ? `${this.spec.queryPrefix} ${text}` : text;
+    // Most registry prefixes end in a space ('query: '); add a separator only when missing.
+    const p = this.spec.queryPrefix;
+    const prefixed = p ? (/\s$/.test(p) ? p + text : `${p} ${text}`) : text;
     return (await this.embedRaw([prefixed]))[0];
   }
 
