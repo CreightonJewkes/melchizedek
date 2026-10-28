@@ -22,7 +22,7 @@ import { detectRerankerBackend } from './reranker.js';
 import { getConfig } from './config.js';
 import { EmbedOrchestrator } from './embed-orchestrator.js';
 import { reconcileVecTables } from './migration.js';
-import { SocketTransport } from './socket-transport.js';
+import { SocketTransport, splitFirstLine } from './socket-transport.js';
 import { createServer, knownSessionId } from './server.js';
 import { initLogger, logger } from './logger.js';
 import type { Embedder, Reranker, SearchContext } from './models.js';
@@ -41,6 +41,9 @@ interface RegisterMessage {
 }
 
 const P = 'daemon';
+
+/** A register line (project path and session id) is small; more than this is not one. */
+const MAX_REGISTER_BYTES = 64 * 1024;
 
 function logMemory(label: string): void {
   const mem = process.memoryUsage();
@@ -158,17 +161,19 @@ if (isMainModule) {
     const socketServer = net.createServer((clientSocket) => {
       connections.add(clientSocket);
       let registered = false;
-      let buffer = '';
+      let head = Buffer.alloc(0);
 
       clientSocket.on('data', async (chunk: Buffer) => {
         if (registered) return; // After register, SocketTransport handles data
 
-        buffer += chunk.toString('utf8');
-        const newlineIdx = buffer.indexOf('\n');
-        if (newlineIdx === -1) return;
-
-        const line = buffer.slice(0, newlineIdx);
-        const rest = buffer.slice(newlineIdx + 1);
+        // Bytes, not strings: a multibyte character split across chunks stays whole.
+        head = Buffer.concat([head, chunk]);
+        const first = splitFirstLine(head);
+        if (!first) {
+          if (head.length > MAX_REGISTER_BYTES) clientSocket.destroy();
+          return;
+        }
+        const { line, rest } = first;
 
         try {
           const msg = JSON.parse(line) as RegisterMessage;
@@ -206,7 +211,7 @@ if (isMainModule) {
 
           // If there was data after the register line, push it back
           if (rest.length > 0) {
-            clientSocket.emit('data', Buffer.from(rest));
+            clientSocket.emit('data', rest);
           }
 
           clientSocket.on('close', () => {
