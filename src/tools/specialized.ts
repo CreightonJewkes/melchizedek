@@ -5,7 +5,8 @@
 import path from 'path';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { search } from '../search.js';
+import type Database from 'better-sqlite3';
+import { search, searchBM25 } from '../search.js';
 import { DateInputError, dateErrorResult, resolveDateRange } from '../dates.js';
 import type { ToolContext } from './context.js';
 
@@ -30,92 +31,11 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
         openWorldHint: false,
       },
     },
-    async ({ filePath, limit }) => {
-      const basename = path.basename(filePath);
-
-      // Strategy 1: LIKE on metadata_json for the file path
-      const metadataRows = ctx.db
-        .prepare(
-          `SELECT c.id, c.session_id, c.idx, c.user_content, c.assistant_content,
-                  c.timestamp, c.metadata_json, s.project
-           FROM conv_chunks c
-           JOIN conv_sessions s ON c.session_id = s.id
-           WHERE c.metadata_json LIKE ?
-             AND c.deleted_at IS NULL
-           ORDER BY c.timestamp DESC
-           LIMIT ?`,
-        )
-        .all(`%${filePath}%`, limit * 2) as Array<{
-        id: string;
-        session_id: string;
-        idx: number;
-        user_content: string;
-        assistant_content: string;
-        timestamp: string;
-        metadata_json: string;
-        project: string;
-      }>;
-
-      // Strategy 2: FTS5 on the basename
-      let ftsRows: typeof metadataRows = [];
-      try {
-        ftsRows = ctx.db
-          .prepare(
-            `SELECT c.id, c.session_id, c.idx, c.user_content, c.assistant_content,
-                    c.timestamp, c.metadata_json, s.project
-             FROM conv_chunks_fts
-             JOIN conv_chunks c ON conv_chunks_fts.rowid = c.rowid
-             JOIN conv_sessions s ON c.session_id = s.id
-             WHERE conv_chunks_fts MATCH ?
-               AND c.deleted_at IS NULL
-             ORDER BY c.timestamp DESC
-             LIMIT ?`,
-          )
-          .all(basename, limit * 2) as typeof metadataRows;
-      } catch {
-        // FTS5 syntax error — skip
-      }
-
-      // Dedup by chunkId, metadata results first (more precise)
-      const seen = new Set<string>();
-      const combined: Array<{
-        chunkId: string;
-        sessionId: string;
-        project: string;
-        timestamp: string;
-        snippet: string;
-        filePaths: string[];
-      }> = [];
-
-      for (const row of [...metadataRows, ...ftsRows]) {
-        if (seen.has(row.id)) continue;
-        seen.add(row.id);
-
-        let filePaths: string[] = [];
-        try {
-          const meta = JSON.parse(row.metadata_json) as { filePaths?: string[] };
-          filePaths = meta.filePaths ?? [];
-        } catch {
-          // ignore parse error
-        }
-
-        combined.push({
-          chunkId: row.id,
-          sessionId: row.session_id,
-          project: row.project,
-          timestamp: row.timestamp,
-          snippet: (row.user_content + ' ' + row.assistant_content).slice(0, 150),
-          filePaths,
-        });
-      }
-
-      // Sort by timestamp DESC, take top limit
-      combined.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(combined.slice(0, limit)) }],
-      };
-    },
+    async ({ filePath, limit }) => ({
+      content: [
+        { type: 'text' as const, text: JSON.stringify(fileHistory(ctx.db, filePath, limit)) },
+      ],
+    }),
   );
 
   server.registerTool(
@@ -273,4 +193,132 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       };
     },
   );
+}
+
+type FileMatch = 'path' | 'suffix' | 'basename' | 'metadata' | 'text';
+
+interface FileRow {
+  id: string;
+  session_id: string;
+  user_content: string;
+  assistant_content: string;
+  timestamp: string;
+  metadata_json: string;
+  project: string;
+}
+
+const FILE_ROW_SQL = `SELECT c.id, c.session_id, c.user_content, c.assistant_content, c.timestamp,
+                             c.metadata_json, s.project
+                      FROM conv_chunks c JOIN conv_sessions s ON s.id = c.session_id`;
+
+/** Escape LIKE wildcards and the escape character, for ESCAPE '\\'. */
+function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, '\\$&');
+}
+
+/** The text as it appears inside a JSON string (metadata_json is written by JSON.stringify). */
+function jsonEscaped(text: string): string {
+  return JSON.stringify(text).slice(1, -1);
+}
+
+/**
+ * Chunks that touched a file, best evidence first:
+ * 1. recorded tool paths (metadata filePaths): the exact path, then a path ending in the
+ *    given one (src/server.ts), then the same basename in another directory;
+ * 2. the path anywhere in the metadata, as a literal substring (a directory, a pattern);
+ * 3. the basename as one quoted text phrase (test_config.py -> "test config py"), for the
+ *    remaining slots only.
+ * Each tier is newest first. Nothing here can throw on user input.
+ */
+function fileHistory(db: Database.Database, filePath: string, limit: number) {
+  const wanted = filePath.trim().replace(/^\.\//, '');
+  const basename = path.basename(wanted);
+  if (!basename) return [];
+  const pool = limit * 2;
+  const tail = '/' + wanted.replace(/^\/+/, '');
+  const found = new Map<string, { row: FileRow; match: FileMatch }>();
+  const add = (rows: FileRow[], match: (r: FileRow) => FileMatch) => {
+    for (const r of rows) if (!found.has(r.id)) found.set(r.id, { row: r, match: match(r) });
+  };
+
+  try {
+    const rows = db
+      .prepare(
+        `SELECT * FROM (
+           SELECT c.id, c.session_id, c.user_content, c.assistant_content, c.timestamp,
+                  c.metadata_json, s.project,
+                  MIN(CASE WHEN fp.value = @wanted THEN 0
+                           WHEN substr(fp.value, -length(@tail)) = @tail THEN 1
+                           ELSE 2 END) AS tier
+           FROM conv_chunks c
+           JOIN conv_sessions s ON s.id = c.session_id
+           JOIN json_each(c.metadata_json, '$.filePaths') fp
+           WHERE c.deleted_at IS NULL
+             AND c.metadata_json LIKE @prefilter ESCAPE '\\'
+             AND json_valid(c.metadata_json)
+             AND (fp.value = @wanted OR fp.value = @basename
+                  OR substr(fp.value, -length(@baseTail)) = @baseTail)
+           GROUP BY c.id)
+         ORDER BY tier, timestamp DESC
+         LIMIT @pool`,
+      )
+      .all({
+        wanted,
+        tail,
+        basename,
+        baseTail: '/' + basename,
+        prefilter: `%${escapeLike(jsonEscaped(basename))}%`,
+        pool,
+      }) as Array<FileRow & { tier: number }>;
+    const tiers: FileMatch[] = ['path', 'suffix', 'basename'];
+    add(rows, (r) => tiers[(r as FileRow & { tier: number }).tier]);
+  } catch {
+    // malformed metadata in an old row: fall through to the literal and text tiers
+  }
+
+  if (found.size < limit) {
+    const rows = db
+      .prepare(
+        `${FILE_ROW_SQL}
+         WHERE c.deleted_at IS NULL AND c.metadata_json LIKE ? ESCAPE '\\'
+         ORDER BY c.timestamp DESC
+         LIMIT ?`,
+      )
+      .all(`%${escapeLike(jsonEscaped(wanted))}%`, pool) as FileRow[];
+    add(rows, () => 'metadata');
+  }
+
+  if (found.size < limit && /[\p{L}\p{N}]/u.test(basename)) {
+    const phrase = `"${basename.replace(/"/g, '""')}"`;
+    const hits = searchBM25(db, phrase, pool, undefined, 'date_desc');
+    if (hits.length > 0) {
+      const ph = hits.map(() => '?').join(',');
+      const rows = db
+        .prepare(`${FILE_ROW_SQL} WHERE c.id IN (${ph})`)
+        .all(...hits.map((h) => h.chunkId)) as FileRow[];
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      add(
+        hits.map((h) => byId.get(h.chunkId)).filter((r): r is FileRow => !!r),
+        () => 'text',
+      );
+    }
+  }
+
+  return [...found.values()].slice(0, limit).map(({ row, match }) => {
+    let filePaths: string[] = [];
+    try {
+      filePaths = (JSON.parse(row.metadata_json) as { filePaths?: string[] }).filePaths ?? [];
+    } catch {
+      // ignore parse error
+    }
+    return {
+      chunkId: row.id,
+      sessionId: row.session_id,
+      project: row.project,
+      timestamp: row.timestamp,
+      snippet: (row.user_content + ' ' + row.assistant_content).slice(0, 150),
+      filePaths,
+      match,
+    };
+  });
 }

@@ -127,6 +127,7 @@ export function chunkMessages(messages: JnlMessage[]): Omit<ConvChunk, 'id'>[] {
 function extractMetadataFromMessages(assistants: JnlMessage[]): ConvChunkMetadata {
   const toolCalls = new Set<string>();
   const filePaths = new Set<string>();
+  const patterns = new Set<string>();
   const errorMessages = new Set<string>();
 
   for (const assistant of assistants) {
@@ -141,7 +142,8 @@ function extractMetadataFromMessages(assistants: JnlMessage[]): ConvChunkMetadat
         const input = b.input as Record<string, unknown> | undefined;
         if (input) {
           if (typeof input.file_path === 'string') filePaths.add(input.file_path);
-          if (typeof input.pattern === 'string') filePaths.add(input.pattern);
+          // Grep and Glob patterns are searches, not files touched.
+          if (typeof input.pattern === 'string') patterns.add(input.pattern);
         }
       }
     }
@@ -150,6 +152,7 @@ function extractMetadataFromMessages(assistants: JnlMessage[]): ConvChunkMetadat
   return {
     toolCalls: [...toolCalls],
     filePaths: [...filePaths],
+    patterns: [...patterns],
     errorMessages: [...errorMessages],
   };
 }

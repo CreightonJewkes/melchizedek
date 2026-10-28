@@ -24,6 +24,8 @@ export type ConvKind = 'exchange' | 'memory';
 export interface ConvChunkMetadata {
   toolCalls: string[];
   filePaths: string[];
+  /** Grep and Glob search patterns, kept apart from the paths tools touched. */
+  patterns: string[];
   errorMessages: string[];
 }
 
