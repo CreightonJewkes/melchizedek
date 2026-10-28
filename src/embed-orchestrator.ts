@@ -15,11 +15,12 @@ import type {
   WorkerStartMessage,
   WorkerOutMessage,
 } from './models.js';
-import { EMBED_ORCHESTRATOR_TIMEOUT_MS } from './constants.js';
+import { EMBED_NO_PROGRESS_MS, EMBED_KILL_GRACE_MS } from './constants.js';
 
 const P = 'embed-orch';
 
-const DEFAULT_TIMEOUT_MS = EMBED_ORCHESTRATOR_TIMEOUT_MS;
+/** ONNX inference threads per embed worker: background work must not lag the machine. */
+export const EMBED_WORKER_THREADS = 2;
 
 export class EmbedOrchestrator {
   private dbPath: string;
@@ -36,11 +37,21 @@ export class EmbedOrchestrator {
     heapUsedMB: null,
   };
   private onStatusChangeCb?: (status: EmbedJobStatus) => void;
+  private busy = false;
+  private lastError: { message: string; at: string } | null = null;
+  private readonly noProgressMs: number;
+  private readonly killGraceMs: number;
 
-  constructor(dbPath: string, db: DatabaseType, options?: { workerPath?: string }) {
+  constructor(
+    dbPath: string,
+    db: DatabaseType,
+    options?: { workerPath?: string; noProgressMs?: number; killGraceMs?: number },
+  ) {
     this.dbPath = dbPath;
     this.db = db;
     this.workerPath = options?.workerPath ?? path.join(import.meta.dirname, 'embed-worker.js');
+    this.noProgressMs = options?.noProgressMs ?? EMBED_NO_PROGRESS_MS;
+    this.killGraceMs = options?.killGraceMs ?? EMBED_KILL_GRACE_MS;
 
     // Clean up stale progress from a previous crash
     this.cleanStaleProgress();
@@ -52,6 +63,32 @@ export class EmbedOrchestrator {
 
   onStatusChange(cb: (status: EmbedJobStatus) => void): void {
     this.onStatusChangeCb = cb;
+  }
+
+  /** True while an embed job or maintenance task holds the single flight. */
+  isBusy(): boolean {
+    return this.busy;
+  }
+
+  /** The most recent job's error, if it failed (cleared by the next successful job). */
+  getLastError(): { message: string; at: string } | null {
+    return this.lastError ? { ...this.lastError } : null;
+  }
+
+  /**
+   * Single flight for everything that writes vectors: embed jobs and maintenance (the
+   * orphan sweep must never run while a worker publishes). A call while another runs
+   * returns false at once rather than queueing; the periodic triggers simply retry.
+   */
+  async runExclusive(fn: () => Promise<void>): Promise<boolean> {
+    if (this.busy) return false;
+    this.busy = true;
+    try {
+      await fn();
+      return true;
+    } finally {
+      this.busy = false;
+    }
   }
 
   async runJob(job: EmbedJobConfig): Promise<{ embedded: number; error?: string }> {
@@ -88,32 +125,53 @@ export class EmbedOrchestrator {
 
       let embedded = 0;
       let resolved = false;
+      // Set once the worker is being stopped; the job ends when the child has exited.
+      let stopping: string | null = null;
+      let progressTimer: ReturnType<typeof setTimeout> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
 
       const finish = (error?: string) => {
         if (resolved) return;
         resolved = true;
-        clearTimeout(timeout);
+        clearTimeout(progressTimer);
+        clearTimeout(killTimer);
         this.cleanProgressMeta(job.suffix);
+        this.lastError = error ? { message: error, at: new Date().toISOString() } : null;
         this.resetStatus();
         resolve({ embedded, error });
       };
 
-      // Timeout
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          logger.warn(P, `Worker timeout (${DEFAULT_TIMEOUT_MS}ms), killing`);
-          child.kill('SIGTERM');
-          finish('timeout');
-        }
-      }, DEFAULT_TIMEOUT_MS);
+      // Stop the worker: SIGTERM, then SIGKILL after the grace period (a worker blocked in
+      // native inference cannot run its SIGTERM handler). finish() waits for 'exit'.
+      const stop = (reason: string) => {
+        if (resolved || stopping) return;
+        stopping = reason;
+        logger.warn(P, `Stopping embed worker: ${reason}`);
+        child.kill('SIGTERM');
+        killTimer = setTimeout(() => {
+          if (!resolved) child.kill('SIGKILL');
+        }, this.killGraceMs);
+      };
+
+      // No total time cap: a slow job may run as long as batches keep finishing.
+      const armProgressTimer = () => {
+        clearTimeout(progressTimer);
+        progressTimer = setTimeout(
+          () => stop(`no progress for ${this.noProgressMs / 1000} s`),
+          this.noProgressMs,
+        );
+      };
+      armProgressTimer();
 
       // IPC messages from worker
       child.on('message', (msg: WorkerOutMessage) => {
         switch (msg.type) {
           case 'ready':
             logger.info(P, `Worker ready: ${msg.modelId} (${msg.dimensions}d)`);
+            armProgressTimer();
             break;
           case 'progress':
+            armProgressTimer();
             embedded = msg.embedded;
             this.status.embedded = msg.embedded;
             this.status.total = msg.total;
@@ -145,7 +203,9 @@ export class EmbedOrchestrator {
       // (a new job may have already assigned a new child)
       child.on('exit', (code) => {
         if (this.child === child) this.child = null;
-        if (code === 0) {
+        if (stopping) {
+          finish(stopping);
+        } else if (code === 0) {
           finish();
         } else {
           finish(`Worker exited with code ${code}`);
@@ -158,11 +218,8 @@ export class EmbedOrchestrator {
       });
 
       child.on('disconnect', () => {
-        // IPC channel broke — child may still be running
-        if (!resolved) {
-          child.kill('SIGTERM');
-          finish('IPC channel disconnected');
-        }
+        // IPC channel broke — the child may still be running; stop it and wait for exit
+        if (!resolved) stop('IPC channel disconnected');
       });
 
       // Send start message
@@ -174,6 +231,7 @@ export class EmbedOrchestrator {
         config: job.config,
         batchSize,
         logLevel: job.logLevel,
+        threads: EMBED_WORKER_THREADS,
       };
       child.send(startMsg);
     });
@@ -190,7 +248,11 @@ export class EmbedOrchestrator {
       embeddingCodeModel: string | null;
       ollamaBaseUrl: string;
     };
-  }): Promise<void> {
+  }): Promise<boolean> {
+    return this.runExclusive(() => this.runJobs(opts));
+  }
+
+  private async runJobs(opts: Parameters<EmbedOrchestrator['runAllJobs']>[0]): Promise<void> {
     if (opts.textEnabled) {
       const result = await this.runJob({
         suffix: '_text',

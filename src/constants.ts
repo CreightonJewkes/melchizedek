@@ -378,7 +378,14 @@ export const CONV_KIND_EXCHANGE = 'exchange' as const;
 export const CONV_KIND_MEMORY = 'memory' as const;
 
 // --- Timeouts ---
-export const EMBED_ORCHESTRATOR_TIMEOUT_MS = 30 * 60 * 1000; // 30 min
+/** An embed worker that finishes no batch for this long is stopped (no total cap). */
+export const EMBED_NO_PROGRESS_MS = 5 * 60 * 1000;
+/** A stopped worker gets this long after SIGTERM before SIGKILL (native inference ignores it). */
+export const EMBED_KILL_GRACE_MS = 10_000;
+/** The daemon looks for chunks without vectors this often, and embeds them when idle. */
+export const EMBED_INTERVAL_MS = 10 * 60 * 1000;
+/** Orphan-vector sweep and compaction cadence (also once at startup). */
+export const VECTOR_MAINTENANCE_MS = 60 * 60 * 1000;
 
 // --- Daemon ---
 export const DAEMON_DIR = path.join(os.homedir(), '.melchizedek');

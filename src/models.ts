@@ -206,6 +206,8 @@ export interface WorkerStartMessage {
   };
   batchSize: number;
   logLevel?: string;
+  /** ONNX inference threads for the worker's model (unset: the runtime's default). */
+  threads?: number;
 }
 
 export type WorkerInMessage = WorkerStartMessage;

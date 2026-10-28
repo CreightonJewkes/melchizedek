@@ -8,7 +8,14 @@
 
 import net from 'net';
 import fs from 'fs';
-import { openDatabase, setStat, drainPendingVecCleanup, flushAllStats } from './db.js';
+import {
+  openDatabase,
+  setStat,
+  drainPendingVecCleanup,
+  flushAllStats,
+  hasPendingEmbeddings,
+  maintainVectors,
+} from './db.js';
 import { backfillExistingSessions, detectOrphanedSessions } from './indexer.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { detectRerankerBackend } from './reranker.js';
@@ -19,7 +26,13 @@ import { SocketTransport } from './socket-transport.js';
 import { createServer } from './server.js';
 import { initLogger, logger } from './logger.js';
 import type { Embedder, Reranker, SearchContext } from './models.js';
-import { DAEMON_DIR, DAEMON_SOCKET_PATH, DAEMON_PID_PATH } from './constants.js';
+import {
+  DAEMON_DIR,
+  DAEMON_SOCKET_PATH,
+  DAEMON_PID_PATH,
+  EMBED_INTERVAL_MS,
+  VECTOR_MAINTENANCE_MS,
+} from './constants.js';
 
 interface RegisterMessage {
   type: 'register';
@@ -283,7 +296,7 @@ if (isMainModule) {
           );
         }
 
-        await orch.runAllJobs({
+        const jobs = {
           textEnabled: !!embedderText && vecEnabled,
           codeEnabled: cfg.embeddingsEnabled && cfg.embeddingCodeEnabled && vecEnabled,
           logLevel: cfg.logLevel,
@@ -294,7 +307,30 @@ if (isMainModule) {
             embeddingCodeModel: cfg.embeddingCodeModel,
             ollamaBaseUrl: cfg.ollamaBaseUrl,
           },
-        });
+        };
+        await orch.runAllJobs(jobs);
+
+        // Vector upkeep and continuous embedding share the orchestrator's single flight,
+        // so the sweep never runs while a worker publishes. Chunks indexed by hooks after
+        // startup get vectors within one interval plus one job.
+        const maintain = () =>
+          orch.runExclusive(async () => {
+            const r = maintainVectors(db);
+            if (r.orphanVectors || r.danglingMaps || r.compacted.length) {
+              logger.info(
+                P,
+                `Vector upkeep: ${r.orphanVectors} orphan vectors, ${r.danglingMaps} dangling maps removed; compacted ${r.compacted.join(', ') || 'none'}`,
+              );
+            }
+          });
+        await maintain();
+        setInterval(() => void maintain(), VECTOR_MAINTENANCE_MS).unref();
+        setInterval(() => {
+          const pending =
+            (jobs.textEnabled && hasPendingEmbeddings(db, '_text')) ||
+            (jobs.codeEnabled && hasPendingEmbeddings(db, '_code'));
+          if (pending && !orch.isBusy()) void orch.runAllJobs(jobs);
+        }, EMBED_INTERVAL_MS).unref();
 
         // Lazy-load code embedder
         if (cfg.embeddingsEnabled && cfg.embeddingCodeEnabled && vecEnabled) {

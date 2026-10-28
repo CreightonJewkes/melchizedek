@@ -725,6 +725,38 @@ export function getChunksWithoutEmbeddings(
     .all(MIN_EMBED_CONTENT_LENGTH, limit) as Array<{ id: string; content: string; hash: string }>;
 }
 
+const PENDING_SQL = (suffix: string) => `
+  FROM conv_chunks c
+  LEFT JOIN conv_vec_map${suffix} m ON c.id = m.chunk_id
+  WHERE m.chunk_id IS NULL
+    AND c.deleted_at IS NULL
+    AND LENGTH(c.user_content) + LENGTH(c.assistant_content) >= ?`;
+
+/** Whether a generation has work: an eligible chunk without a vector, or a migration. */
+export function hasPendingEmbeddings(db: Database.Database, suffix = '_text'): boolean {
+  if (getMeta(db, `migration_target_model${suffix}`) !== null) return true;
+  try {
+    return !!db.prepare(`SELECT 1 ${PENDING_SQL(suffix)} LIMIT 1`).get(MIN_EMBED_CONTENT_LENGTH);
+  } catch {
+    return false; // no vector tables for this generation
+  }
+}
+
+/**
+ * When the longest-waiting eligible chunk without a vector was written (indexed_at; rows
+ * written before schema 4 have none), or null when nothing with a known time is pending.
+ */
+export function oldestPendingEmbedding(db: Database.Database, suffix = '_text'): string | null {
+  try {
+    const row = db
+      .prepare(`SELECT MIN(c.indexed_at) AS at ${PENDING_SQL(suffix)}`)
+      .get(MIN_EMBED_CONTENT_LENGTH) as { at: string | null };
+    return row.at;
+  } catch {
+    return null;
+  }
+}
+
 export function countEligibleChunks(db: Database.Database): number {
   const row = db
     .prepare(

@@ -88,6 +88,17 @@ process.on('message', async (msg: WorkerInMessage) => {
 
   const startTime = Date.now();
 
+  // Background work: the lowest CPU priority and capped inference threads, set by the
+  // worker on itself so no other process is ever reniced.
+  try {
+    os.setPriority(0, os.constants.priority.PRIORITY_LOW); // 19, the lowest
+  } catch {
+    // not permitted here: keep the inherited priority
+  }
+  if (msg.threads && !process.env.M9K_ONNX_THREADS) {
+    process.env.M9K_ONNX_THREADS = String(msg.threads);
+  }
+
   try {
     // Initialize logger with parent's log level
     if (msg.logLevel) {

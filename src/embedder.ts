@@ -176,7 +176,15 @@ export class TransformersJsEmbedder implements Embedder {
       // Try each dtype in order of preference
       for (const dtype of this.spec.dtypePreference) {
         try {
-          this.pipe = await pipeline(EMBEDDING_PIPELINE_TASK, this.spec.hfModelId, { dtype });
+          // Embed workers cap inference threads (M9K_ONNX_THREADS), so background
+          // embedding leaves the machine's other cores alone.
+          const threads = parseInt(process.env.M9K_ONNX_THREADS ?? '', 10);
+          this.pipe = await pipeline(EMBEDDING_PIPELINE_TASK, this.spec.hfModelId, {
+            dtype,
+            ...(threads > 0
+              ? { session_options: { intraOpNumThreads: threads, interOpNumThreads: 1 } }
+              : {}),
+          });
           logger.info(
             P,
             `Model loaded: ${this.spec.key} (${this.spec.dimensions}d, dtype=${dtype})`,
