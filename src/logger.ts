@@ -20,8 +20,16 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 let currentLevel: LogLevel = 'warn';
 let fileStream: RotatingFileStream | null = null;
 
-export function initLogger(opts?: { level?: LogLevel; logDir?: string }): void {
+/**
+ * `file: false` logs to stderr only. Embed workers use it: a second rotating stream on the
+ * daemon's file would rotate it from two processes.
+ */
+export function initLogger(opts?: { level?: LogLevel; logDir?: string; file?: boolean }): void {
   currentLevel = opts?.level ?? 'warn';
+  if (opts?.file === false) {
+    fileStream = null;
+    return;
+  }
   const logDir = opts?.logDir ?? path.join(os.homedir(), '.melchizedek', 'logs');
   fs.mkdirSync(logDir, { recursive: true });
 

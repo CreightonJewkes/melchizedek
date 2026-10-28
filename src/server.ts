@@ -330,7 +330,9 @@ async function runLocalMode(): Promise<void> {
       const orphanResult = detectOrphanedSessions(db, cfg.syncPurge);
       setStat(db, 'orphaned_sessions', String(orphanResult.orphanedCount));
       if (orphanResult.orphanedCount > 0) {
-        logger.warn(
+        // Sessions whose transcript is gone are normal (the database is the archive); only a
+        // purge, which deletes them, is worth a warning.
+        logger[orphanResult.purgedCount > 0 ? 'warn' : 'info'](
           P,
           `Orphaned sessions: ${orphanResult.orphanedCount} detected, ${orphanResult.purgedCount} purged`,
         );

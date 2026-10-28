@@ -4,9 +4,7 @@
  * Communicates with parent via IPC messages (WorkerInMessage / WorkerOutMessage).
  */
 
-import fs from 'fs';
 import os from 'os';
-import path from 'path';
 import { openDatabase, createVecTables } from './db.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { seedEmbeddingMeta, detectModelChange, EmbeddingMigration } from './migration.js';
@@ -16,16 +14,9 @@ import type { WorkerInMessage, WorkerOutMessage } from './models.js';
 
 const P = 'embed-worker';
 
-/** Synchronous file write — survives native crashes (no buffering) */
+/** Worker debug lines go through the logger, so the configured level applies to them. */
 function dbg(msg: string): void {
-  const ts = new Date().toISOString();
-  const line = `${ts} [DEBUG] [${P}] ${msg}\n`;
-  try {
-    const logPath = path.join(os.homedir(), '.melchizedek', 'logs', 'melchizedek.log');
-    fs.appendFileSync(logPath, line);
-  } catch {
-    // log dir might not exist
-  }
+  logger.debug(P, msg);
 }
 
 function logMemory(label: string): void {
@@ -101,9 +92,11 @@ process.on('message', async (msg: WorkerInMessage) => {
 
   try {
     // Initialize logger with parent's log level
-    if (msg.logLevel) {
-      initLogger({ level: msg.logLevel as 'debug' | 'info' | 'warn' | 'error' });
-    }
+    // stderr only (inherited from the daemon): the daemon owns the rotating log file.
+    initLogger({
+      level: (msg.logLevel ?? 'warn') as 'debug' | 'info' | 'warn' | 'error',
+      file: false,
+    });
 
     logger.debug(
       P,
