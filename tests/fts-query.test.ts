@@ -59,6 +59,10 @@ describe('keyword query builder (A1)', () => {
     expect(buildFtsQuery('🎉')).toBe('');
   });
 
+  it('joins with AND when every term must match (date order, A9)', () => {
+    expect(buildFtsQuery('kafka NOT lag', { all: true })).toBe('"kafka" AND "NOT" AND "lag"');
+  });
+
   it('caps the number of terms as a safety bound', () => {
     const many = Array.from({ length: MAX_QUERY_TERMS + 50 }, (_, i) => `w${i}`).join(' ');
     expect(buildFtsQuery(many).split(' OR ')).toHaveLength(MAX_QUERY_TERMS);

@@ -3,7 +3,13 @@
  */
 
 import type Database from 'better-sqlite3';
-import type { MatchType, SearchContext, SearchOptions, SearchResult } from './models.js';
+import type {
+  MatchType,
+  SearchContext,
+  SearchOptions,
+  SearchOrder,
+  SearchResult,
+} from './models.js';
 import { incrementStat, setStat } from './db.js';
 import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
@@ -18,11 +24,11 @@ export const MAX_QUERY_TERMS = 128;
  * (AND, OR, NOT, NEAR) and stray quotes literal, so the expression can never be a syntax
  * error; a dotted or hyphenated name stays one phrase ("test_config.py" matches the tokens
  * test config py in order). Terms with no letter or digit are dropped. Returns '' when
- * nothing searchable remains.
+ * nothing searchable remains. With `all`, every term must match (AND) instead of any.
  */
 export function buildFtsQuery(
   text: string,
-  opts: { prefix?: boolean; minChars?: number } = {},
+  opts: { prefix?: boolean; minChars?: number; all?: boolean } = {},
 ): string {
   const minChars = opts.minChars ?? 1;
   const terms = text
@@ -30,7 +36,7 @@ export function buildFtsQuery(
     .filter((t) => (t.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= minChars)
     .slice(0, MAX_QUERY_TERMS);
   const star = opts.prefix ? '*' : '';
-  return terms.map((t) => `"${t.replace(/"/g, '""')}"${star}`).join(' OR ');
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"${star}`).join(opts.all ? ' AND ' : ' OR ');
 }
 
 /** Keyword-search failures by cause, since process start (reported by m9k_info). */
@@ -79,12 +85,22 @@ function filterSql(f?: SearchFilters): { sql: string; params: string[] } {
   return { sql: parts.map((p) => ` AND ${p}`).join(''), params };
 }
 
-/** BM25 over an FTS5 expression (build it with buildFtsQuery). Never throws. */
+const ORDER_SQL: Record<SearchOrder, string> = {
+  score: 'score',
+  date_asc: 'c.timestamp ASC',
+  date_desc: 'c.timestamp DESC',
+};
+
+/**
+ * BM25 over an FTS5 expression (build it with buildFtsQuery). Never throws. A date order
+ * returns the earliest (or latest) matches in the scope instead of the best-scoring ones.
+ */
 export function searchBM25(
   db: Database.Database,
   expr: string,
   limit: number,
   filters?: SearchFilters,
+  order: SearchOrder = 'score',
 ): SearchResult[] {
   if (!expr.trim()) return [];
 
@@ -97,7 +113,7 @@ export function searchBM25(
     JOIN conv_sessions s ON c.session_id = s.id
     WHERE conv_chunks_fts MATCH ?
       AND c.deleted_at IS NULL${f.sql}
-    ORDER BY score
+    ORDER BY ${ORDER_SQL[order]}
     LIMIT ?
   `);
 
@@ -441,6 +457,22 @@ export async function search(
     }
   }
 
+  // Date order: the earliest (or latest) exchanges in the scope that contain every term,
+  // read in time order from the whole match set rather than re-sorted from the relevance
+  // top-k. The relevance list fills any slots left; the reranker and boosts are skipped.
+  const chronological = options.order === 'date_asc' || options.order === 'date_desc';
+  if (chronological) {
+    const dated = searchBM25(
+      db,
+      buildFtsQuery(options.query, { all: true }),
+      options.limit * 2,
+      filters,
+      options.order,
+    );
+    const inDated = new Set(dated.map((r) => r.chunkId));
+    results = [...dated, ...results.filter((r) => !inDated.has(r.chunkId))];
+  }
+
   // Copies of one exchange (sessions resumed or forked from another) take one slot.
   results = dedupeByHash(db, results);
 
@@ -449,7 +481,7 @@ export async function search(
   // behind them. Logits become rank scores on the RRF scale, so later multipliers stay
   // well-defined.
   const tRerank0 = performance.now();
-  if (ctx?.reranker && results.length > 1) {
+  if (ctx?.reranker && results.length > 1 && !chronological) {
     try {
       const pool = results.slice(0, RERANK_POOL);
       const ph = pool.map(() => '?').join(',');
@@ -483,7 +515,7 @@ export async function search(
   // Affinity boosts multiply the (positive) fused or rank score, before the final cut.
   const projectBoost = !options.project && options.currentProject ? PROJECT_BOOST_FACTOR : 1;
   const sessionBoost = options.currentSession ? SESSION_BOOST_FACTOR : 1;
-  if (projectBoost !== 1 || sessionBoost !== 1) {
+  if (!chronological && (projectBoost !== 1 || sessionBoost !== 1)) {
     for (const r of results) {
       if (projectBoost !== 1 && r.project === options.currentProject) r.score *= projectBoost;
       if (sessionBoost !== 1 && r.sessionId === options.currentSession) r.score *= sessionBoost;
@@ -491,14 +523,12 @@ export async function search(
     results.sort((a, b) => b.score - a.score);
   }
 
-  // Re-sort if order is date-based (default is score from BM25/RRF/reranker)
-  if (options.order === 'date_asc') {
-    results.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  } else if (options.order === 'date_desc') {
-    results.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  }
-
   const finalResults = capPerSession(results, options.maxPerSession).slice(0, options.limit);
+  if (options.order === 'date_asc') {
+    finalResults.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  } else if (options.order === 'date_desc') {
+    finalResults.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  }
 
   // Update usage counters (best-effort, don't fail the search)
   try {
