@@ -59,10 +59,12 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       },
     },
     async ({ errorMessage, limit }) => {
+      // No cross-encoder here: it is trained on natural-language questions and reorders
+      // error strings worse than fusion does (top-5 session hits 18 of 25 without it, 15 with).
       const results = await search(
         ctx.db,
         { query: errorMessage, limit: limit * 3 },
-        ctx.searchContext,
+        { ...ctx.searchContext, reranker: null },
       );
 
       // Enrich with error/solution extraction, filter by substantial assistant response
