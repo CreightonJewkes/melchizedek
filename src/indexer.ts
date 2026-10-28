@@ -157,12 +157,33 @@ function extractMetadataFromMessages(assistants: JnlMessage[]): ConvChunkMetadat
   };
 }
 
+/** What a caller knows about the transcript it read: its mtime, from a stat taken before the read. */
+export interface SourceRevision {
+  mtimeMs: number;
+}
+
+/**
+ * Whether the stored index comes from a later read of the transcript than this one, so this
+ * snapshot is stale (two hooks of one session can commit out of order). Revisions compare by
+ * modification time, then size (transcripts are append-only). Without both mtimes: no check.
+ */
+function storedIsNewer(
+  stored: { file_size: number | null; file_mtime: number | null },
+  revision: SourceRevision | undefined,
+  fileSize: number,
+): boolean {
+  if (!revision || stored.file_mtime == null) return false;
+  if (stored.file_mtime !== revision.mtimeMs) return stored.file_mtime > revision.mtimeMs;
+  return (stored.file_size ?? 0) > fileSize;
+}
+
 export function indexConvSession(
   db: Database.Database,
   sessionId: string,
   jsonlContent: string,
   project: string,
   jsonlPath: string,
+  revision?: SourceRevision,
 ): 'indexed' | 'skipped' {
   // Every writer (startup backfill, SessionEnd, PreCompact) passes through here.
   if (isProjectIgnored(db, project)) return 'skipped';
@@ -196,68 +217,141 @@ export function indexConvSession(
   const startedAt = messages.length > 0 ? messages[0].timestamp : new Date().toISOString();
   const endedAt = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
 
-  if (existingSession) {
-    // Re-indexing: delete old chunks but preserve soft-deleted ones (forget tombstones)
-    deleteChunksWhere(db, 'session_id = ? AND deleted_at IS NULL', [sessionId]);
-    db.prepare(
-      `UPDATE conv_sessions SET project = ?, jsonl_path = ?, file_hash = ?, file_size = ?,
-       started_at = ?, ended_at = ?, message_count = ?, chunk_count = ?, indexed_at = datetime('now')
-       WHERE id = ?`,
-    ).run(
-      project,
-      jsonlPath,
-      fileHash,
-      fileSize,
-      startedAt,
-      endedAt,
-      messages.length,
-      chunks.length,
-      sessionId,
-    );
-  } else {
-    db.prepare(
-      `INSERT INTO conv_sessions (id, project, jsonl_path, file_hash, file_size, started_at, ended_at, message_count, chunk_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      sessionId,
-      project,
-      jsonlPath,
-      fileHash,
-      fileSize,
-      startedAt,
-      endedAt,
-      messages.length,
-      chunks.length,
-    );
-  }
+  // Parsing and chunking happen above, outside any transaction. The write is one short
+  // IMMEDIATE transaction: revision check, session row, then a diff by chunk id and hash,
+  // so unchanged chunks keep their vectors and a crash leaves the previous index whole.
+  return db
+    .transaction((): 'indexed' | 'skipped' => {
+      const stored = db
+        .prepare(
+          'SELECT file_hash, file_size, file_mtime, deleted_at FROM conv_sessions WHERE id = ?',
+        )
+        .get(sessionId) as
+        | {
+            file_hash: string;
+            file_size: number | null;
+            file_mtime: number | null;
+            deleted_at: string | null;
+          }
+        | undefined;
+      if (stored?.deleted_at || stored?.file_hash === fileHash) return 'skipped';
+      if (stored && storedIsNewer(stored, revision, fileSize)) return 'skipped';
 
-  // Insert chunks with dedup by hash
-  const insertChunk = db.prepare(
-    `INSERT OR IGNORE INTO conv_chunks (id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
+      const mtime = revision?.mtimeMs ?? null;
+      if (stored) {
+        db.prepare(
+          `UPDATE conv_sessions SET project = ?, jsonl_path = ?, file_hash = ?, file_size = ?,
+           file_mtime = ?, started_at = ?, ended_at = ?, message_count = ?, chunk_count = ?,
+           indexed_at = datetime('now')
+           WHERE id = ?`,
+        ).run(
+          project,
+          jsonlPath,
+          fileHash,
+          fileSize,
+          mtime,
+          startedAt,
+          endedAt,
+          messages.length,
+          chunks.length,
+          sessionId,
+        );
+      } else {
+        db.prepare(
+          `INSERT INTO conv_sessions (id, project, jsonl_path, file_hash, file_size, file_mtime, started_at, ended_at, message_count, chunk_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          sessionId,
+          project,
+          jsonlPath,
+          fileHash,
+          fileSize,
+          mtime,
+          startedAt,
+          endedAt,
+          messages.length,
+          chunks.length,
+        );
+      }
 
-  const insertMany = db.transaction(() => {
-    for (const chunk of chunks) {
-      const chunkId = `${sessionId}:${chunk.index}`;
-      insertChunk.run(
-        chunkId,
-        sessionId,
-        chunk.index,
-        chunk.kind,
-        chunk.userContent,
-        chunk.assistantContent,
-        chunk.hash,
-        chunk.timestamp,
-        chunk.tokenCount,
-        chunk.tags ? JSON.stringify(chunk.tags) : null,
-        JSON.stringify(chunk.metadata),
+      const existing = db
+        .prepare(
+          `SELECT id, hash, deleted_at, kind, timestamp, token_count, tags, metadata_json
+           FROM conv_chunks WHERE session_id = ?`,
+        )
+        .all(sessionId) as Array<{
+        id: string;
+        hash: string;
+        deleted_at: string | null;
+        kind: string;
+        timestamp: string;
+        token_count: number | null;
+        tags: string | null;
+        metadata_json: string;
+      }>;
+      const live = new Map(existing.filter((r) => !r.deleted_at).map((r) => [r.id, r]));
+      // Forgotten positions stay forgotten, and so does forgotten text that moved.
+      const tombIds = new Set(existing.filter((r) => r.deleted_at).map((r) => r.id));
+      const tombHashes = new Set(existing.filter((r) => r.deleted_at).map((r) => r.hash));
+
+      const wanted = chunks.map((c) => ({
+        ...c,
+        id: `${sessionId}:${c.index}`,
+        tagsJson: c.tags ? JSON.stringify(c.tags) : null,
+        metadataJson: JSON.stringify(c.metadata),
+      }));
+      const wantedById = new Map(wanted.map((c) => [c.id, c]));
+
+      // Removed and changed rows go first, with their vectors (L4): a hash that moved to
+      // another position then cannot trip UNIQUE(session_id, hash) on insert.
+      const stale = [...live.values()]
+        .filter((r) => wantedById.get(r.id)?.hash !== r.hash)
+        .map((r) => r.id);
+      if (stale.length > 0) {
+        deleteChunksWhere(db, 'id IN (SELECT value FROM json_each(?))', [JSON.stringify(stale)]);
+      }
+
+      const insertChunk = db.prepare(
+        `INSERT OR IGNORE INTO conv_chunks (id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json, indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
       );
-    }
-  });
-
-  insertMany();
-  return 'indexed';
+      const refresh = db.prepare(
+        `UPDATE conv_chunks SET kind = ?, timestamp = ?, token_count = ?, tags = ?, metadata_json = ?
+         WHERE id = ?`,
+      );
+      for (const c of wanted) {
+        const old = live.get(c.id);
+        if (old && old.hash === c.hash) {
+          // Unchanged text keeps its row and vector; only metadata may have moved on.
+          if (
+            old.kind !== c.kind ||
+            old.timestamp !== c.timestamp ||
+            old.token_count !== c.tokenCount ||
+            old.tags !== c.tagsJson ||
+            old.metadata_json !== c.metadataJson
+          ) {
+            refresh.run(c.kind, c.timestamp, c.tokenCount, c.tagsJson, c.metadataJson, c.id);
+          }
+          continue;
+        }
+        if (tombIds.has(c.id) || tombHashes.has(c.hash)) continue;
+        insertChunk.run(
+          c.id,
+          sessionId,
+          c.index,
+          c.kind,
+          c.userContent,
+          c.assistantContent,
+          c.hash,
+          c.timestamp,
+          c.tokenCount,
+          c.tagsJson,
+          c.metadataJson,
+        );
+      }
+      return 'indexed';
+    })
+    .immediate();
 }
 
 /**
@@ -304,6 +398,7 @@ export function backfillExistingSessions(db: Database.Database, jsonlDir: string
       const sessionId = path.basename(file, '.jsonl');
 
       try {
+        const { mtimeMs } = fs.statSync(jsonlPath); // before the read (revision check)
         const content = fs.readFileSync(jsonlPath, 'utf8');
         const messages = parseJSONL(content);
         const project = extractProjectFromJsonl(messages) ?? projectDir;
@@ -314,7 +409,7 @@ export function backfillExistingSessions(db: Database.Database, jsonlDir: string
           continue;
         }
 
-        const status = indexConvSession(db, sessionId, content, project, jsonlPath);
+        const status = indexConvSession(db, sessionId, content, project, jsonlPath, { mtimeMs });
         if (status === 'indexed') {
           result.indexed++;
         } else {

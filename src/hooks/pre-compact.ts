@@ -27,7 +27,10 @@ export function handlePreCompact(hookInput: HookInput): {
   }
 
   let content: string;
+  let mtimeMs: number;
   try {
+    // Stat before reading, so the recorded revision is never newer than the content.
+    mtimeMs = fs.statSync(transcriptPath).mtimeMs;
     content = fs.readFileSync(transcriptPath, 'utf8');
   } catch (err) {
     console.error(`[melchizedek] PreCompact: failed to read ${transcriptPath}:`, err);
@@ -50,6 +53,7 @@ export function handlePreCompact(hookInput: HookInput): {
       content,
       hookInput.cwd,
       transcriptPath,
+      { mtimeMs },
     );
     if (status === 'skipped') {
       console.error(`[melchizedek] PreCompact: session=${hookInput.session_id} unchanged, skipped`);

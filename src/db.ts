@@ -56,7 +56,7 @@ export function openMemoryDatabase(): DatabaseInfo {
   return { db, vecEnabled, schemaReady };
 }
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * The database is NOT a cache: most archived sessions no longer have a transcript on
@@ -95,6 +95,24 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         `UPDATE conv_chunks SET timestamp = strftime('%Y-%m-%dT%H:%M:%fZ', timestamp)
          WHERE timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:*'`,
       ).run();
+    },
+  },
+  {
+    version: 4,
+    name: 'transcript mtime (re-index revision check); chunk indexed_at (embedding freshness)',
+    run: (db) => {
+      const has = (table: string, col: string) =>
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
+          (c) => c.name === col,
+        );
+      if (!has('conv_sessions', 'file_mtime')) {
+        db.exec('ALTER TABLE conv_sessions ADD COLUMN file_mtime INTEGER');
+      }
+      // When the row was written; an unchanged chunk keeps its row on re-index, so for a
+      // chunk without a vector this is how long it has waited. NULL for older rows.
+      if (!has('conv_chunks', 'indexed_at')) {
+        db.exec('ALTER TABLE conv_chunks ADD COLUMN indexed_at TEXT');
+      }
     },
   },
 ];

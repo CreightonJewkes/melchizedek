@@ -81,14 +81,19 @@ export function handleSessionEnd(hookInput: HookInput): { indexed: boolean; erro
     }
 
     let content: string;
+    let mtimeMs: number;
     try {
+      // Stat before reading, so the recorded revision is never newer than the content.
+      mtimeMs = fs.statSync(transcriptPath).mtimeMs;
       content = fs.readFileSync(transcriptPath, 'utf8');
     } catch (err) {
       console.error(`[melchizedek] SessionEnd: failed to read ${transcriptPath}:`, err);
       return { indexed: false, error: 'failed to read transcript' };
     }
 
-    indexConvSession(db, hookInput.session_id, content, hookInput.cwd, transcriptPath);
+    indexConvSession(db, hookInput.session_id, content, hookInput.cwd, transcriptPath, {
+      mtimeMs,
+    });
     console.error(
       `[melchizedek] SessionEnd: indexed session=${hookInput.session_id}, path=${transcriptPath}`,
     );

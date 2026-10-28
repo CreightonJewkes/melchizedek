@@ -91,8 +91,8 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
       // INSERT OR IGNORE for dedup by hash
       const result = ctx.db
         .prepare(
-          `INSERT OR IGNORE INTO conv_chunks (id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json)
-         VALUES (?, ?, 0, ?, ?, '', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, '{}')`,
+          `INSERT OR IGNORE INTO conv_chunks (id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json, indexed_at)
+         VALUES (?, ?, 0, ?, ?, '', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, '{}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
         )
         .run(
           chunkId,
