@@ -8,6 +8,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import {
   getStat,
+  readStat,
   getMeta,
   countEligibleChunks,
   countEmbeddedChunks,
@@ -261,10 +262,10 @@ export function registerMemoryTools(server: McpServer, ctx: ToolContext): void {
       const ignoredProjects = getIgnoredProjects(ctx.db).length;
       const orphanedSessions = parseInt(getStat(ctx.db, 'orphaned_sessions') ?? '0', 10);
 
-      const searchCount = parseInt(getStat(ctx.db, 'search_count') ?? '0', 10);
-      const hitCount = parseInt(getStat(ctx.db, 'hit_count') ?? '0', 10);
-      const tokensServed = parseInt(getStat(ctx.db, 'tokens_served') ?? '0', 10);
-      const lastSearchAt = getStat(ctx.db, 'last_search_at');
+      const searchCount = parseInt(readStat(ctx.db, 'search_count') ?? '0', 10);
+      const hitCount = parseInt(readStat(ctx.db, 'hit_count') ?? '0', 10);
+      const tokensServed = parseInt(readStat(ctx.db, 'tokens_served') ?? '0', 10);
+      const lastSearchAt = readStat(ctx.db, 'last_search_at');
 
       // --- Search lines: one readable string per embedder ---
       const embeddingModelIdText = getMeta(ctx.db, 'embedding_model_id_text');

@@ -6,7 +6,7 @@
 import { readFileSync } from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { openDatabase, setStat, drainPendingVecCleanup } from './db.js';
+import { openDatabase, setStat, drainPendingVecCleanup, flushAllStats } from './db.js';
 import { backfillExistingSessions, detectOrphanedSessions } from './indexer.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { detectRerankerBackend } from './reranker.js';
@@ -290,6 +290,7 @@ async function runLocalMode(): Promise<void> {
   let shuttingDown = false;
   const cleanup = (signal?: string) => {
     orch.abort();
+    flushAllStats();
     if (signal && !shuttingDown) {
       shuttingDown = true;
       setTimeout(() => process.exit(0), 500).unref();

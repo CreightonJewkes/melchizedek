@@ -8,7 +8,7 @@
 
 import net from 'net';
 import fs from 'fs';
-import { openDatabase, setStat, drainPendingVecCleanup } from './db.js';
+import { openDatabase, setStat, drainPendingVecCleanup, flushAllStats } from './db.js';
 import { backfillExistingSessions, detectOrphanedSessions } from './indexer.js';
 import { createTextEmbedder, createCodeEmbedder } from './embedder.js';
 import { detectRerankerBackend } from './reranker.js';
@@ -232,6 +232,7 @@ if (isMainModule) {
 
       orch.abort();
       socketServer.close();
+      flushAllStats();
 
       for (const conn of connections) {
         conn.destroy();

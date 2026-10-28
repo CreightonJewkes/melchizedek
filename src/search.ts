@@ -10,7 +10,7 @@ import type {
   SearchOrder,
   SearchResult,
 } from './models.js';
-import { incrementStat, setStat } from './db.js';
+import { queueStats } from './db.js';
 import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
 import { vectorIndexMatches } from './migration.js';
@@ -530,21 +530,15 @@ export async function search(
     finalResults.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   }
 
-  // Update usage counters (best-effort, don't fail the search)
-  try {
-    incrementStat(db, 'search_count');
-    if (finalResults.length > 0) {
-      incrementStat(db, 'hit_count');
-      const tokensServed = finalResults.reduce(
-        (sum, r) => sum + Math.ceil(r.snippet.length / 4),
-        0,
-      );
-      incrementStat(db, 'tokens_served', tokensServed);
-    }
-    setStat(db, 'last_search_at', new Date().toISOString());
-  } catch {
-    // Non-critical — don't fail searches if stats write fails
-  }
+  // Usage counters are queued in memory and flushed in the background (never on this path).
+  const tokensServed = finalResults.reduce((sum, r) => sum + Math.ceil(r.snippet.length / 4), 0);
+  queueStats(
+    db,
+    finalResults.length > 0
+      ? { search_count: 1, hit_count: 1, tokens_served: tokensServed }
+      : { search_count: 1 },
+    { last_search_at: new Date().toISOString() },
+  );
 
   return finalResults;
 }

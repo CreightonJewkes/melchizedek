@@ -271,10 +271,92 @@ export function setStat(db: Database.Database, key: string, value: string): void
   db.prepare('INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)').run(key, value);
 }
 
+/** One statement, so concurrent writers (daemon, hooks, other servers) never lose a count. */
 export function incrementStat(db: Database.Database, key: string, delta = 1): void {
-  const current = getStat(db, key);
-  const newValue = (current ? parseInt(current, 10) : 0) + delta;
-  setStat(db, key, String(newValue));
+  db.prepare(
+    `INSERT INTO stats (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)`,
+  ).run(key, String(delta));
+}
+
+// --- Buffered usage counters ---
+
+/** Queued counters reach the database in one short write this often. */
+export const STATS_FLUSH_MS = 30_000;
+/** A flush waits at most this long for another writer's lock, then drops its counts. */
+const STATS_FLUSH_BUSY_MS = 100;
+
+interface PendingStats {
+  add: Map<string, number>;
+  set: Map<string, string>;
+}
+const pendingStats = new Map<Database.Database, PendingStats>();
+let statsTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Queue counter increments and values for the next flush. Never touches the database, so a
+ * search cannot wait on a lock held by a hook writing in another process.
+ */
+export function queueStats(
+  db: Database.Database,
+  add: Record<string, number>,
+  set: Record<string, string> = {},
+): void {
+  let p = pendingStats.get(db);
+  if (!p) {
+    p = { add: new Map(), set: new Map() };
+    pendingStats.set(db, p);
+  }
+  for (const [k, v] of Object.entries(add)) p.add.set(k, (p.add.get(k) ?? 0) + v);
+  for (const [k, v] of Object.entries(set)) p.set.set(k, v);
+  if (!statsTimer) {
+    statsTimer = setInterval(flushAllStats, STATS_FLUSH_MS);
+    statsTimer.unref();
+  }
+}
+
+/**
+ * Write one connection's queued counters in a single transaction. A flush that cannot get
+ * the write lock within STATS_FLUSH_BUSY_MS, or fails otherwise, is dropped: these are
+ * usage figures, not data. Returns false when counts were dropped.
+ */
+export function flushStats(db: Database.Database): boolean {
+  const p = pendingStats.get(db);
+  pendingStats.delete(db);
+  if (pendingStats.size === 0 && statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = undefined;
+  }
+  if (!p) return true;
+  if (!db.open) return false;
+  const busy = db.pragma('busy_timeout', { simple: true }) as number;
+  try {
+    db.pragma(`busy_timeout = ${STATS_FLUSH_BUSY_MS}`);
+    db.transaction(() => {
+      for (const [k, v] of p.add) incrementStat(db, k, v);
+      for (const [k, v] of p.set) setStat(db, k, v);
+    }).immediate();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (db.open) db.pragma(`busy_timeout = ${busy}`);
+  }
+}
+
+/** A stat as readers should see it: queued increments added, a queued value preferred. */
+export function readStat(db: Database.Database, key: string): string | null {
+  const p = pendingStats.get(db);
+  const queued = p?.set.get(key);
+  if (queued !== undefined) return queued;
+  const stored = getStat(db, key);
+  const add = p?.add.get(key);
+  return add === undefined ? stored : String((stored ? parseInt(stored, 10) : 0) + add);
+}
+
+/** Flush every connection's queued counters (the timer, and shutdown). */
+export function flushAllStats(): void {
+  for (const db of [...pendingStats.keys()]) flushStats(db);
 }
 
 // --- Vector CRUD ---
@@ -635,5 +717,6 @@ export function purgeProjectData(db: Database.Database, project: string): PurgeR
 }
 
 export function closeDatabase(db: Database.Database): void {
+  flushStats(db);
   db.close();
 }

@@ -3,7 +3,7 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { getStat } from '../db.js';
+import { readStat } from '../db.js';
 import type { DatabaseType } from '../db.js';
 import type { ToolContext } from './context.js';
 
@@ -24,8 +24,8 @@ export function buildUsageGuide(db: DatabaseType, version: string): string {
       .get() as { cnt: number }
   ).cnt;
 
-  const searchCount = parseInt(getStat(db, 'search_count') ?? '0', 10);
-  const tokensServed = parseInt(getStat(db, 'tokens_served') ?? '0', 10);
+  const searchCount = parseInt(readStat(db, 'search_count') ?? '0', 10);
+  const tokensServed = parseInt(readStat(db, 'tokens_served') ?? '0', 10);
 
   const statsLine =
     sessions > 0
