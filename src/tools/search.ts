@@ -95,6 +95,14 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           .max(10)
           .default(3)
           .describe('Number of chunks before/after to include'),
+        budgetChars: z
+          .number()
+          .int()
+          .min(1000)
+          .optional()
+          .describe(
+            'Optional reply size budget in characters: the target and its nearest neighbours, whole, while they fit; the rest are listed in omitted. Stored text is never cut.',
+          ),
       },
       annotations: {
         readOnlyHint: true,
@@ -103,7 +111,7 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
         openWorldHint: false,
       },
     },
-    async ({ chunkId, window }) => {
+    async ({ chunkId, window, budgetChars }) => {
       const target = ctx.db
         .prepare('SELECT session_id, idx FROM conv_chunks WHERE id = ? AND deleted_at IS NULL')
         .get(chunkId) as { session_id: string; idx: number } | undefined;
@@ -128,13 +136,38 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           `SELECT id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json
            FROM conv_chunks WHERE session_id = ? AND idx BETWEEN ? AND ? AND deleted_at IS NULL ORDER BY idx`,
         )
-        .all(target.session_id, minIdx, maxIdx);
+        .all(target.session_id, minIdx, maxIdx) as Array<{ id: string; idx: number }>;
 
+      if (budgetChars === undefined) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({ target: chunkId, chunks: rows }),
+            },
+          ],
+        };
+      }
+      // Nearest first (the target is at distance 0), whole chunks only, until one does not fit.
+      const kept = new Set<string>();
+      let used = 0;
+      for (const r of [...rows].sort(
+        (a, b) => Math.abs(a.idx - target.idx) - Math.abs(b.idx - target.idx),
+      )) {
+        const size = JSON.stringify(r).length;
+        if (kept.size > 0 && used + size > budgetChars) break;
+        kept.add(r.id);
+        used += size;
+      }
       return {
         content: [
           {
             type: 'text' as const,
-            text: JSON.stringify({ target: chunkId, chunks: rows }),
+            text: JSON.stringify({
+              target: chunkId,
+              chunks: rows.filter((r) => kept.has(r.id)),
+              omitted: rows.filter((r) => !kept.has(r.id)).map((r) => r.id),
+            }),
           },
         ],
       };
@@ -148,6 +181,14 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
         'Retrieve full content of chunks by IDs. Use after m9k_search to get complete context.',
       inputSchema: {
         chunkIds: z.array(z.string()).min(1).max(20).describe('Chunk IDs to retrieve in full'),
+        budgetChars: z
+          .number()
+          .int()
+          .min(1000)
+          .optional()
+          .describe(
+            'Optional reply size budget in characters. Whole chunks in the given order while they fit (at least one); the reply is then { chunks, missing, next }, and next can be passed to a second call. Stored text is never cut.',
+          ),
       },
       annotations: {
         readOnlyHint: true,
@@ -156,15 +197,38 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
         openWorldHint: false,
       },
     },
-    async ({ chunkIds }) => {
-      const placeholders = chunkIds.map(() => '?').join(',');
+    async ({ chunkIds, budgetChars }) => {
+      const ids = [...new Set(chunkIds)];
+      const placeholders = ids.map(() => '?').join(',');
       const stmt = ctx.db.prepare(
         `SELECT id, session_id, idx, kind, user_content, assistant_content, hash, timestamp, token_count, tags, metadata_json
          FROM conv_chunks WHERE id IN (${placeholders}) AND deleted_at IS NULL`,
       );
-      const rows = stmt.all(...chunkIds);
+      const byId = new Map((stmt.all(...ids) as Array<{ id: string }>).map((r) => [r.id, r]));
+      // In the order asked for (SQL IN returns rowid order), each id once.
+      const ordered = ids.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []));
+      if (budgetChars === undefined) {
+        return { content: [{ type: 'text' as const, text: JSON.stringify(ordered) }] };
+      }
+      const chunks: typeof ordered = [];
+      let used = 0;
+      for (const r of ordered) {
+        const size = JSON.stringify(r).length;
+        if (chunks.length > 0 && used + size > budgetChars) break;
+        chunks.push(r);
+        used += size;
+      }
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(rows) }],
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              chunks,
+              missing: ids.filter((id) => !byId.has(id)),
+              next: ordered.slice(chunks.length).map((r) => r.id),
+            }),
+          },
+        ],
       };
     },
   );
