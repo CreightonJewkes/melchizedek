@@ -33,6 +33,17 @@ describe('relative dates (A5)', () => {
     expect(normalizeDateBound('last month', 'since', NOW)).toBe(local(2026, 1, 4, 15, 30));
   });
 
+  it('month arithmetic clamps at month ends', () => {
+    const mar31 = new Date(2026, 2, 31, 12, 0);
+    expect(normalizeDateBound('1 month ago', 'since', mar31)).toBe(local(2026, 1, 28, 12, 0));
+    expect(normalizeDateBound('last month', 'since', new Date(2026, 9, 31, 9, 0))).toBe(
+      local(2026, 8, 30, 9, 0),
+    );
+    expect(normalizeDateBound('2 months ago', 'since', new Date(2026, 4, 31))).toBe(
+      local(2026, 2, 31),
+    );
+  });
+
   it('day arithmetic follows the local calendar across a DST change', () => {
     // 2026-03-08 is a US DST start; "1 day ago" from 03-09 noon is 03-08 noon local.
     const after = new Date(2026, 2, 9, 12, 0);

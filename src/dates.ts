@@ -77,7 +77,13 @@ function minus(now: Date, n: number, unit: Unit): Date {
   else if (unit === 'hour') d.setTime(d.getTime() - n * 3_600_000);
   else if (unit === 'day') d.setDate(d.getDate() - n);
   else if (unit === 'week') d.setDate(d.getDate() - 7 * n);
-  else d.setMonth(d.getMonth() - n);
+  else {
+    // Clamp to the target month's length: one month before Mar 31 is Feb 28, not Mar 3.
+    const day = d.getDate();
+    d.setDate(1);
+    d.setMonth(d.getMonth() - n);
+    d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+  }
   return d;
 }
 
