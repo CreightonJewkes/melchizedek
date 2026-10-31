@@ -994,9 +994,11 @@ describe('MCP server with reranker', () => {
   let db: Database.Database;
   let server: McpServer;
   let client: Client;
+  let rerankPools: number[];
 
   beforeEach(async () => {
     db = openMemoryDatabase().db;
+    rerankPools = [];
 
     // Index fixture data
     const content = readFileSync(join(FIXTURES_DIR, 'normal_session.jsonl'), 'utf8');
@@ -1015,6 +1017,7 @@ describe('MCP server with reranker', () => {
         documents: { id: string; content: string }[],
         topN: number,
       ) => {
+        rerankPools.push(documents.length);
         return documents
           .map((d) => ({
             id: d.id,
@@ -1086,6 +1089,10 @@ describe('MCP server with reranker', () => {
     const top = JSON.parse((full.content as Array<{ text: string }>)[0].text)[0];
     expect((top.user_content + ' ' + top.assistant_content).toLowerCase()).toContain('middleware');
     expect(data[0].score).toBeGreaterThan(data[1].score);
+    // BM25 alone already puts a middleware chunk first: prove the server's search ran the
+    // reranker, once, over the whole candidate pool.
+    expect(rerankPools).toHaveLength(1);
+    expect(rerankPools[0]).toBeGreaterThan(1);
   });
 
   it('m9k_info should show reranker in search section', async () => {
