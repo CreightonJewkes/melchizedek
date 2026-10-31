@@ -562,10 +562,17 @@ export function drainPendingVecCleanup(db: Database.Database): number {
       db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").pluck().all() as string[],
     );
     for (const r of rows) {
-      if (existing.has(r.vec_table)) {
-        db.prepare(`DELETE FROM ${r.vec_table} WHERE rowid = ?`).run(r.vec_rowid);
-        countDeadVectors(db, r.vec_table, 1);
-      }
+      if (!existing.has(r.vec_table)) continue;
+      // A compaction or migration swap rebuilds the table and can hand a queued rowid to a
+      // live vector, so only rowids that no map row points at are deleted.
+      const map = 'conv_vec_map' + r.vec_table.slice('conv_vec'.length);
+      if (
+        existing.has(map) &&
+        db.prepare(`SELECT 1 FROM ${map} WHERE vec_rowid = ?`).get(r.vec_rowid)
+      )
+        continue;
+      const removed = db.prepare(`DELETE FROM ${r.vec_table} WHERE rowid = ?`).run(r.vec_rowid);
+      if (removed.changes) countDeadVectors(db, r.vec_table, removed.changes);
     }
     db.prepare('DELETE FROM pending_vec_cleanup').run();
     return rows.length;

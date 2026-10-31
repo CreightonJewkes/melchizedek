@@ -10,6 +10,7 @@ import {
   deleteChunksWhere,
   deleteSessionsWhere,
   drainPendingVecCleanup,
+  getMeta,
   ignoreProject,
 } from '../src/db.js';
 import {
@@ -182,6 +183,24 @@ describe('deletion without sqlite-vec (L4)', () => {
       n: 0,
     });
     daemonSide.close();
+  });
+
+  it('the drain never deletes a queued rowid that a live vector holds again', () => {
+    const tmp = tempDbPath();
+    cleanup = tmp.cleanup;
+    const db = openDatabase(tmp.dbPath).db;
+    seedSyntheticCorpus(db);
+    seedVectors(db, ['_text'], LIVE_CHUNKS);
+    // After a compaction or a swap rebuilt the table, a queued rowid can be a live vector's.
+    const live = db.prepare('SELECT vec_rowid FROM conv_vec_map_text LIMIT 1').pluck().get();
+    db.prepare('INSERT INTO pending_vec_cleanup (vec_table, vec_rowid) VALUES (?, ?)').run(
+      'conv_vec_text',
+      live,
+    );
+    expect(drainPendingVecCleanup(db)).toBe(1);
+    expect(vectorCounts(db, '_text')).toEqual({ vec: 5, map: 5 });
+    expect(getMeta(db, 'vec_dead_rows:conv_vec_text')).toBeNull();
+    db.close();
   });
 
   it('waits out another process holding the write lock instead of failing at once', async () => {
