@@ -300,8 +300,10 @@ describe.skipIf(!hasWorkingEmbedder)('embed-worker integration', () => {
     seedChunks(dbPath, 100); // Lots of chunks to keep it busy
 
     const child = fork(WORKER_PATH, [], {
-      stdio: ['pipe', 'pipe', 'inherit', 'ipc'],
+      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     });
+    let stderr = '';
+    child.stderr!.on('data', (d: Buffer) => (stderr += d.toString()));
 
     let exitCode: number | null = null;
     const exitPromise = new Promise<void>((resolve) => {
@@ -334,7 +336,8 @@ describe.skipIf(!hasWorkingEmbedder)('embed-worker integration', () => {
 
     await exitPromise;
 
-    // Should have been terminated (exit code null = killed by signal, or non-zero)
-    expect(exitCode === null || exitCode !== 0).toBe(true);
+    // A stop finishes the batch and exits cleanly, not through the fatal-error path.
+    expect(stderr).not.toContain('Fatal error');
+    expect(exitCode).toBe(0);
   }, 30_000);
 });

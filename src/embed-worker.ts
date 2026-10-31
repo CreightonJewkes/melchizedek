@@ -35,8 +35,10 @@ function migrationFailureMessage(
     : `migration${suffix} failed after ${result.embedded} chunks; old index kept`;
 }
 
+// After SIGTERM the channel is closed: a send or a second disconnect would throw and turn
+// a clean stop into the fatal-error exit (and ONNX's abort on process.exit).
 function send(msg: WorkerOutMessage): void {
-  if (process.send) {
+  if (process.send && process.connected) {
     process.send(msg);
   }
 }
@@ -217,7 +219,7 @@ process.on('message', async (msg: WorkerInMessage) => {
     // Disconnect IPC channel and let the process exit naturally.
     // Avoid process.exit(0) — ONNX runtime cleanup crashes with
     // "libc++abi: mutex lock failed" when exit is called explicitly.
-    if (process.disconnect) process.disconnect();
+    if (process.connected) process.disconnect();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error(P, 'Fatal error:', err);
