@@ -138,6 +138,22 @@ describe('continuous embedding (B3)', () => {
     expect(ran).toBe(true);
   });
 
+  it('a failing task neither rejects nor holds the flight; its error is kept', async () => {
+    // The daemon runs upkeep from a timer: a rejection here would end the process.
+    expect(
+      await orch.runExclusive(async () => {
+        throw new Error('database is locked');
+      }),
+    ).toBe(true);
+    expect(orch.getLastError()?.message).toBe('database is locked');
+    expect(orch.isBusy()).toBe(false);
+    let ran = false;
+    await orch.runExclusive(async () => {
+      ran = true;
+    });
+    expect(ran).toBe(true);
+  });
+
   it('records a crash as the last error, and the next run starts cleanly', async () => {
     const run = orch.runJob(job);
     await sleep(5);

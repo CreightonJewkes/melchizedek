@@ -81,16 +81,22 @@ export class EmbedOrchestrator {
    * Single flight for everything that writes vectors: embed jobs and maintenance (the
    * orphan sweep must never run while a worker publishes). A call while another runs
    * returns false at once rather than queueing; the periodic triggers simply retry.
+   * A failing task never rejects (the daemon calls this from timers, where a rejection
+   * would end the process): its error is logged and kept as the last error.
    */
   async runExclusive(fn: () => Promise<void>): Promise<boolean> {
     if (this.busy) return false;
     this.busy = true;
     try {
       await fn();
-      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(P, `Background task failed: ${message}`);
+      this.lastError = { message, at: new Date().toISOString() };
     } finally {
       this.busy = false;
     }
+    return true;
   }
 
   async runJob(job: EmbedJobConfig): Promise<{ embedded: number; error?: string }> {

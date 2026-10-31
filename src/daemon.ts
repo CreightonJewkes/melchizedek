@@ -301,43 +301,53 @@ if (isMainModule) {
             `Orphaned sessions: ${orphanResult.orphanedCount} detected, ${orphanResult.purgedCount} purged`,
           );
         }
+      } catch (err) {
+        logger.error(P, 'Startup indexing error:', err);
+      }
 
-        const jobs = {
-          textEnabled: !!embedderText && vecEnabled,
-          codeEnabled: cfg.embeddingsEnabled && cfg.embeddingCodeEnabled && vecEnabled,
-          logLevel: cfg.logLevel,
-          config: {
-            embeddingTextBackend: cfg.embeddingTextBackend,
-            embeddingTextModel: cfg.embeddingTextModel,
-            embeddingCodeBackend: cfg.embeddingCodeBackend,
-            embeddingCodeModel: cfg.embeddingCodeModel,
-            ollamaBaseUrl: cfg.ollamaBaseUrl,
-          },
-        };
-        await orch.runAllJobs(jobs);
+      const jobs = {
+        textEnabled: !!embedderText && vecEnabled,
+        codeEnabled: cfg.embeddingsEnabled && cfg.embeddingCodeEnabled && vecEnabled,
+        logLevel: cfg.logLevel,
+        config: {
+          embeddingTextBackend: cfg.embeddingTextBackend,
+          embeddingTextModel: cfg.embeddingTextModel,
+          embeddingCodeBackend: cfg.embeddingCodeBackend,
+          embeddingCodeModel: cfg.embeddingCodeModel,
+          ollamaBaseUrl: cfg.ollamaBaseUrl,
+        },
+      };
+      await orch.runAllJobs(jobs);
 
-        // Vector upkeep and continuous embedding share the orchestrator's single flight,
-        // so the sweep never runs while a worker publishes. Chunks indexed by hooks after
-        // startup get vectors within one interval plus one job.
-        const maintain = () =>
-          orch.runExclusive(async () => {
-            const r = maintainVectors(db);
-            if (r.orphanVectors || r.danglingMaps || r.compacted.length) {
-              logger.info(
-                P,
-                `Vector upkeep: ${r.orphanVectors} orphan vectors, ${r.danglingMaps} dangling maps removed; compacted ${r.compacted.join(', ') || 'none'}`,
-              );
-            }
-          });
-        await maintain();
-        setInterval(() => void maintain(), VECTOR_MAINTENANCE_MS).unref();
-        setInterval(() => {
+      // Vector upkeep and continuous embedding share the orchestrator's single flight,
+      // so the sweep never runs while a worker publishes. Chunks indexed by hooks after
+      // startup get vectors within one interval plus one job. The timers are armed
+      // whatever the startup steps did, and the single flight never rejects, so one
+      // failed pass cannot stop the daemon or its upkeep.
+      const maintain = () =>
+        orch.runExclusive(async () => {
+          const r = maintainVectors(db);
+          if (r.orphanVectors || r.danglingMaps || r.compacted.length) {
+            logger.info(
+              P,
+              `Vector upkeep: ${r.orphanVectors} orphan vectors, ${r.danglingMaps} dangling maps removed; compacted ${r.compacted.join(', ') || 'none'}`,
+            );
+          }
+        });
+      await maintain();
+      setInterval(() => void maintain(), VECTOR_MAINTENANCE_MS).unref();
+      setInterval(() => {
+        try {
           const pending =
             (jobs.textEnabled && hasPendingEmbeddings(db, '_text')) ||
             (jobs.codeEnabled && hasPendingEmbeddings(db, '_code'));
           if (pending && !orch.isBusy()) void orch.runAllJobs(jobs);
-        }, EMBED_INTERVAL_MS).unref();
+        } catch (err) {
+          logger.warn(P, 'Pending-embedding check failed:', err);
+        }
+      }, EMBED_INTERVAL_MS).unref();
 
+      try {
         // Lazy-load code embedder
         if (cfg.embeddingsEnabled && cfg.embeddingCodeEnabled && vecEnabled) {
           const codeEmb = await createCodeEmbedder({
@@ -356,7 +366,7 @@ if (isMainModule) {
           }
         }
       } catch (err) {
-        logger.error(P, 'Background task error:', err);
+        logger.error(P, 'Code embedder load error:', err);
       }
     });
   })().catch((err) => {
