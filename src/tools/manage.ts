@@ -128,14 +128,16 @@ export function registerManageTools(server: McpServer, ctx: ToolContext): void {
       ).cnt;
 
       // Soft delete: hard-delete chunks (clean search), tombstone session row
-      ctx.db.transaction(() => {
-        deleteChunksWhere(ctx.db, 'session_id = ?', [sessionId]);
-        ctx.db
-          .prepare(
-            "UPDATE conv_sessions SET deleted_at = datetime('now'), chunk_count = 0 WHERE id = ?",
-          )
-          .run(sessionId);
-      })();
+      ctx.db
+        .transaction(() => {
+          deleteChunksWhere(ctx.db, 'session_id = ?', [sessionId]);
+          ctx.db
+            .prepare(
+              "UPDATE conv_sessions SET deleted_at = datetime('now'), chunk_count = 0 WHERE id = ?",
+            )
+            .run(sessionId);
+        })
+        .immediate();
 
       return {
         content: [

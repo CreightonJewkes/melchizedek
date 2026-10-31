@@ -468,8 +468,13 @@ export function vectorTables(db: Database.Database): Array<{ map: string; vec: s
   return names.map((map) => ({ map, vec: 'conv_vec' + map.slice('conv_vec_map'.length) }));
 }
 
+/**
+ * Run fn in a write transaction, or inside the caller's. IMMEDIATE takes the write lock
+ * first, so busy_timeout applies: a deferred transaction that reads and then writes gets
+ * SQLITE_BUSY at once while a hook is writing.
+ */
 function inTransaction<T>(db: Database.Database, fn: () => T): T {
-  return db.inTransaction ? fn() : db.transaction(fn)();
+  return db.inTransaction ? fn() : db.transaction(fn).immediate();
 }
 
 const ID_BATCH = 500;

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { fork } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -7,6 +8,7 @@ import {
   openDatabase,
   openMemoryDatabase,
   deleteChunksWhere,
+  deleteSessionsWhere,
   drainPendingVecCleanup,
   ignoreProject,
 } from '../src/db.js';
@@ -181,4 +183,37 @@ describe('deletion without sqlite-vec (L4)', () => {
     });
     daemonSide.close();
   });
+
+  it('waits out another process holding the write lock instead of failing at once', async () => {
+    const tmp = tempDbPath();
+    cleanup = tmp.cleanup;
+    const daemonSide = openDatabase(tmp.dbPath).db;
+    seedSyntheticCorpus(daemonSide);
+    seedVectors(daemonSide, ['_text'], LIVE_CHUNKS);
+
+    // A hook process re-indexing holds the write lock for a moment.
+    const holder = path.join(path.dirname(tmp.dbPath), 'hold.mjs');
+    const pkg = path.join(import.meta.dirname, '..', 'package.json');
+    fs.writeFileSync(
+      holder,
+      `import { createRequire } from 'module';
+       const Database = createRequire(${JSON.stringify(pkg)})('better-sqlite3');
+       const db = new Database(process.argv[2]);
+       db.exec('BEGIN IMMEDIATE');
+       process.send('locked');
+       setTimeout(() => { db.exec('COMMIT'); db.close(); process.exit(0); }, 300);`,
+    );
+    const child = fork(holder, [tmp.dbPath]);
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    await new Promise((resolve) => child.once('message', resolve));
+
+    // A deferred transaction reads first, then fails to upgrade with SQLITE_BUSY at once.
+    expect(deleteSessionsWhere(daemonSide, "id = 'sess-live'")).toEqual({
+      sessions: 1,
+      chunks: 3,
+    });
+    expect(vectorCounts(daemonSide, '_text')).toEqual({ vec: 2, map: 2 });
+    await exited;
+    daemonSide.close();
+  }, 15_000);
 });
