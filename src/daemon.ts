@@ -10,6 +10,7 @@ import net from 'net';
 import fs from 'fs';
 import {
   openDatabase,
+  closeDatabase,
   setStat,
   drainPendingVecCleanup,
   flushAllStats,
@@ -264,6 +265,13 @@ if (isMainModule) {
       }
 
       setTimeout(() => process.exit(0), 500).unref();
+      // A clean close checkpoints the WAL, so a stopped daemon leaves no -wal file that
+      // would corrupt a rollback restoring memory.db by copy.
+      try {
+        closeDatabase(db);
+      } catch (err) {
+        logger.warn(P, 'Database close failed:', err);
+      }
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
