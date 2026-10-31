@@ -352,6 +352,8 @@ export class EmbeddingMigration {
         setMeta(this.db, `embedding_model_id${s}`, targetModel);
         setMeta(this.db, `embedding_dimensions${s}`, String(targetDimensions));
         setMeta(this.db, `embedding_recipe${s}`, targetRecipe);
+        // The rebuilt table has no dead slots.
+        deleteMeta(this.db, `vec_dead_rows:conv_vec${s}`);
         this.cleanupMigrationMeta();
       })
       .immediate();
@@ -377,6 +379,7 @@ export class EmbeddingMigration {
     deleteMeta(this.db, `migration_target_recipe${this.suffix}`);
     deleteMeta(this.db, `migration_progress${this.suffix}`);
     deleteMeta(this.db, `migration_started_at${this.suffix}`);
+    deleteMeta(this.db, `vec_dead_rows:conv_vec${this.suffix}_next`);
   }
 
   /** Full lifecycle: prepare → reembed → swap | abort */

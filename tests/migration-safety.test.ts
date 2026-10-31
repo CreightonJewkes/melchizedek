@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type Database from 'better-sqlite3';
-import { openMemoryDatabase, getMeta, getVecTableDimensions } from '../src/db.js';
+import { openMemoryDatabase, getMeta, setMeta, getVecTableDimensions } from '../src/db.js';
 import { embedChunks, indexConvSession } from '../src/indexer.js';
 import {
   EmbeddingMigration,
@@ -164,6 +164,22 @@ describe('safe model migration (L2)', () => {
     expect(vectorIndexMatches(db, newModel)).toBe(true);
     expect(await vectorHits()).toBeGreaterThan(0);
     expect(await staleMappedVectors(db, newModel)).toEqual([]);
+  });
+
+  it('a swap clears the dead-slot counts it replaces; an abort clears only the next one', async () => {
+    setMeta(db, 'vec_dead_rows:conv_vec_text', '30');
+    const aborted = new EmbeddingMigration(db, newModel, { batchSize: 50 });
+    aborted.prepare();
+    setMeta(db, 'vec_dead_rows:conv_vec_text_next', '5');
+    aborted.abort();
+    expect(getMeta(db, 'vec_dead_rows:conv_vec_text_next')).toBeNull();
+    expect(getMeta(db, 'vec_dead_rows:conv_vec_text')).toBe('30'); // old generation unchanged
+
+    setMeta(db, 'vec_dead_rows:conv_vec_text_next', '5');
+    const result = await new EmbeddingMigration(db, newModel, { batchSize: 50 }).run();
+    expect(result.swapped).toBe(true);
+    expect(getMeta(db, 'vec_dead_rows:conv_vec_text')).toBeNull();
+    expect(getMeta(db, 'vec_dead_rows:conv_vec_text_next')).toBeNull();
   });
 
   it('dimension-changing switch keeps the old tables at startup and replaces them atomically', async () => {
