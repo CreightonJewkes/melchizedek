@@ -153,6 +153,8 @@ export interface MelchizedekConfig {
    */
   projectBoost: number;
   logLevel: LogLevel;
+  /** Log every tool call locally to ~/.melchizedek/logs/search.jsonl (src/search-log.ts). Off by default. */
+  searchLog: boolean;
 }
 
 export interface OrphanDetectionResult {

@@ -26,6 +26,7 @@ import {
 import type { ToolContext } from './tools/index.js';
 
 import net from 'net';
+import { logToolCalls } from './search-log.js';
 import { spawn } from 'child_process';
 import path from 'path';
 import { DAEMON_SOCKET_PATH } from './constants.js';
@@ -105,6 +106,8 @@ export function createServer(
     name: 'melchizedek',
     version: VERSION,
   });
+  if (cfg.searchLog)
+    logToolCalls(server, { session: options?.currentSession, project: currentProject });
 
   const ctx: ToolContext = {
     db,

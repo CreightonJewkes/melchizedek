@@ -13,6 +13,7 @@ import type {
 import { queueStats } from './db.js';
 import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
+import { recordStage } from './search-log.js';
 import { vectorIndexMatches } from './migration.js';
 
 /** Upper bound on OR terms in one keyword expression (a safety limit, not pruning). */
@@ -392,6 +393,7 @@ export async function search(
   const bm25Results = searchBM25(db, buildFtsQuery(options.query), options.limit * 2, filters);
   const t1 = performance.now();
   logger.debug('search', ` BM25: ${(t1 - t0).toFixed(0)}ms (${bm25Results.length} results)`);
+  recordStage('bm25', t1 - t0);
 
   let results: SearchResult[];
 
@@ -411,10 +413,12 @@ export async function search(
       const emb = await embedFn.call(ctx.embedderText, options.query);
       const t3 = performance.now();
       logger.debug('search', ` text embed: ${(t3 - t2).toFixed(0)}ms`);
+      recordStage('text_embed', t3 - t2);
       vecLists.push(
         searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_text', filters),
       );
       logger.debug('search', ` text vec search: ${(performance.now() - t3).toFixed(0)}ms`);
+      recordStage('text_vec', performance.now() - t3);
     } catch (err) {
       logger.warn('search', 'Text vector search failed — degrading gracefully', err);
     }
@@ -431,10 +435,12 @@ export async function search(
       const emb = await embedFn.call(ctx.embedderCode, options.query);
       const t5 = performance.now();
       logger.debug('search', ` code embed: ${(t5 - t4).toFixed(0)}ms`);
+      recordStage('code_embed', t5 - t4);
       vecLists.push(
         searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_code', filters),
       );
       logger.debug('search', ` code vec search: ${(performance.now() - t5).toFixed(0)}ms`);
+      recordStage('code_vec', performance.now() - t5);
     } catch (err) {
       logger.warn('search', 'Code vector search failed — degrading gracefully', err);
     }
@@ -510,6 +516,7 @@ export async function search(
     }
   }
   logger.debug('search', ` reranker: ${(performance.now() - tRerank0).toFixed(0)}ms`);
+  recordStage('rerank', performance.now() - tRerank0);
 
   // Affinity boosts multiply the (positive) fused or rank score, before the final cut.
   const projectBoost = !options.project && options.currentProject ? (options.projectBoost ?? 1) : 1;

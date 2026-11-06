@@ -73,6 +73,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
     autoFuzzyThreshold: 3,
     projectBoost: 1,
     logLevel: 'warn',
+    searchLog: false,
   };
 
   // Env vars (only set if explicitly defined)
@@ -104,6 +105,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
   if (process.env.M9K_PROJECT_BOOST) env.projectBoost = parseFloat(process.env.M9K_PROJECT_BOOST);
   if (process.env.M9K_LOG_LEVEL)
     env.logLevel = process.env.M9K_LOG_LEVEL as MelchizedekConfig['logLevel'];
+  if (process.env.M9K_SEARCH_LOG === 'true') env.searchLog = true;
 
   // Merge: defaults < config.json < env vars < overrides
   return { ...defaults, ...file, ...env, ...overrides };
