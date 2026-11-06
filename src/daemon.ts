@@ -70,8 +70,10 @@ function cleanStaleDaemon(): void {
     const pid = parseInt(fs.readFileSync(DAEMON_PID_PATH, 'utf8'), 10);
     try {
       process.kill(pid, 0); // Check if process is alive
+      // Another daemon already serves the socket (often one a proxy started first), so there is
+      // nothing to do: exit 0, so a supervisor that restarts only on failure leaves it be.
       logger.warn(P, `Daemon already running (pid ${pid})`);
-      process.exit(1);
+      process.exit(0);
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
         // PID dead — stale socket
