@@ -6,6 +6,7 @@
  *   tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir> [--set main|hard|errors|files]
  *                        [--model <registry key>] [--no-rerank] [--limit 10] [--max-per-session N]
  *                        [--depth N]   (minimum candidates per channel; unset keeps limit × 2)
+ *                        [--windows]   (the copy was re-embedded with split prompt/reply windows)
  *
  * Model files are read from M9K_MODEL_CACHE (a transformers.js cache dir) when set; remote downloads
  * stay off. Boosts are neutral (no currentProject / currentSession). Nothing here writes to the DB
@@ -72,8 +73,9 @@ env.allowRemoteModels = false;
 const { db, vecEnabled } = openDatabase(dbPath);
 if (!vecEnabled) throw new Error('sqlite-vec failed to load');
 
-const spec = lookupModelSpec(modelKey);
-if (!spec) throw new Error(`unknown model key ${modelKey}`);
+const found = lookupModelSpec(modelKey);
+if (!found) throw new Error(`unknown model key ${modelKey}`);
+const spec = flag('windows') ? { ...found, splitWindows: true } : found;
 const embedder: Embedder = new TransformersJsEmbedder(spec);
 const reranker = flag('no-rerank') ? null : new TransformersJsReranker();
 
@@ -226,6 +228,7 @@ async function main(): Promise<void> {
     model: modelKey,
     rerank: !!reranker,
     depth: DEPTH,
+    windows: !!spec.splitWindows,
     n: queries.length,
     p50_ms: +pct(0.5).toFixed(1),
     p95_ms: +pct(0.95).toFixed(1),

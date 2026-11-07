@@ -15,6 +15,7 @@ import { RRF_K } from './constants.js';
 import { logger } from './logger.js';
 import { recordStage } from './search-log.js';
 import { vectorIndexMatches } from './migration.js';
+import { hasSecondWindow, secondWindowSuffix } from './windows.js';
 
 /** Upper bound on OR terms in one keyword expression (a safety limit, not pruning). */
 export const MAX_QUERY_TERMS = 128;
@@ -154,6 +155,40 @@ export function searchBM25(
  */
 const MAX_VECTOR_DISTANCE = 1.3;
 
+/** The table pairs a generation's vectors live in: its own, plus the reply window's if split. */
+function vectorPairs(db: Database.Database, suffix: string): string[] {
+  return hasSecondWindow(db, suffix) ? [suffix, secondWindowSuffix(suffix)] : [suffix];
+}
+
+/**
+ * KNN over one table pair, as chunk ID -> distance. Two steps, because sqlite-vec virtual
+ * tables are slow when JOINed directly with regular tables (the optimizer can't push the
+ * MATCH down): KNN on the vec table alone, then rowids -> chunk IDs through the map.
+ */
+function nearestChunks(
+  db: Database.Database,
+  queryEmbedding: Float32Array,
+  k: number,
+  suffix: string,
+): Map<string, number> {
+  const vecRows = db
+    .prepare(
+      `SELECT rowid, distance FROM conv_vec${suffix}
+       WHERE embedding MATCH ? AND k = ?
+       ORDER BY distance`,
+    )
+    .all(Buffer.from(queryEmbedding.buffer), k) as Array<{ rowid: number; distance: number }>;
+  if (vecRows.length === 0) return new Map();
+  const distanceByRowid = new Map(vecRows.map((r) => [r.rowid, r.distance]));
+  const mapRows = db
+    .prepare(
+      `SELECT vec_rowid, chunk_id FROM conv_vec_map${suffix}
+       WHERE vec_rowid IN (${vecRows.map(() => '?').join(',')})`,
+    )
+    .all(...vecRows.map((r) => r.rowid)) as Array<{ vec_rowid: number; chunk_id: string }>;
+  return new Map(mapRows.map((m) => [m.chunk_id, distanceByRowid.get(m.vec_rowid)!]));
+}
+
 export function searchVectorized(
   db: Database.Database,
   queryEmbedding: Float32Array,
@@ -166,40 +201,19 @@ export function searchVectorized(
     return searchVectorizedScoped(db, queryEmbedding, limit, maxDistance, suffix, filters);
   }
 
-  // Two-step approach: sqlite-vec virtual tables are slow when JOINed directly
-  // with regular tables (SQLite optimizer can't push down the MATCH efficiently).
-  // Step 1: KNN search on the vec table only (~2ms for 5k vectors)
-  const vecRows = db
-    .prepare(
-      `SELECT rowid, distance FROM conv_vec${suffix}
-       WHERE embedding MATCH ? AND k = ?
-       ORDER BY distance`,
-    )
-    .all(Buffer.from(queryEmbedding.buffer), limit) as Array<{
-    rowid: number;
-    distance: number;
-  }>;
-
-  if (vecRows.length === 0) return [];
-
-  // Step 2: resolve rowids → chunk_ids via map table, then hydrate from chunks
-  const rowids = vecRows.map((r) => r.rowid);
-  const distanceByRowid = new Map(vecRows.map((r) => [r.rowid, r.distance]));
-
-  const placeholders = rowids.map(() => '?').join(',');
-  const mapRows = db
-    .prepare(
-      `SELECT vec_rowid, chunk_id FROM conv_vec_map${suffix}
-       WHERE vec_rowid IN (${placeholders})`,
-    )
-    .all(...rowids) as Array<{ vec_rowid: number; chunk_id: string }>;
-
-  if (mapRows.length === 0) return [];
-
-  const chunkIds = mapRows.map((m) => m.chunk_id);
-  const distanceByChunkId = new Map(
-    mapRows.map((m) => [m.chunk_id, distanceByRowid.get(m.vec_rowid)!]),
-  );
+  // Split windows: a chunk is as near as its nearer window, collapsed before the cut.
+  const distanceByChunkId = new Map<string, number>();
+  for (const table of vectorPairs(db, suffix)) {
+    for (const [chunkId, distance] of nearestChunks(db, queryEmbedding, limit, table)) {
+      const best = distanceByChunkId.get(chunkId);
+      if (best === undefined || distance < best) distanceByChunkId.set(chunkId, distance);
+    }
+  }
+  if (distanceByChunkId.size === 0) return [];
+  const chunkIds = [...distanceByChunkId]
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, limit)
+    .map(([id]) => id);
 
   const chunkPlaceholders = chunkIds.map(() => '?').join(',');
   const chunkRows = db
@@ -252,20 +266,7 @@ function searchVectorizedScoped(
   filters: SearchFilters,
 ): SearchResult[] {
   const f = filterSql(filters);
-  const rows = db
-    .prepare(
-      `SELECT c.id, c.user_content, c.assistant_content, c.session_id, c.timestamp, s.project,
-              v.distance
-       FROM (SELECT rowid AS vec_rowid, vec_distance_l2(embedding, ?) AS distance
-             FROM conv_vec${suffix}) v
-       CROSS JOIN conv_vec_map${suffix} m ON m.vec_rowid = v.vec_rowid
-       CROSS JOIN conv_chunks c ON c.id = m.chunk_id
-       CROSS JOIN conv_sessions s ON s.id = c.session_id
-       WHERE c.deleted_at IS NULL AND v.distance <= ?${f.sql}
-       ORDER BY v.distance
-       LIMIT ?`,
-    )
-    .all(Buffer.from(queryEmbedding.buffer), maxDistance, ...f.params, limit) as Array<{
+  type Row = {
     id: string;
     user_content: string;
     assistant_content: string;
@@ -273,7 +274,30 @@ function searchVectorizedScoped(
     timestamp: string;
     project: string;
     distance: number;
-  }>;
+  };
+  // Each window pair is scored exactly; a chunk keeps its nearer window.
+  const best = new Map<string, Row>();
+  for (const table of vectorPairs(db, suffix)) {
+    const rows = db
+      .prepare(
+        `SELECT c.id, c.user_content, c.assistant_content, c.session_id, c.timestamp, s.project,
+                v.distance
+         FROM (SELECT rowid AS vec_rowid, vec_distance_l2(embedding, ?) AS distance
+               FROM conv_vec${table}) v
+         CROSS JOIN conv_vec_map${table} m ON m.vec_rowid = v.vec_rowid
+         CROSS JOIN conv_chunks c ON c.id = m.chunk_id
+         CROSS JOIN conv_sessions s ON s.id = c.session_id
+         WHERE c.deleted_at IS NULL AND v.distance <= ?${f.sql}
+         ORDER BY v.distance
+         LIMIT ?`,
+      )
+      .all(Buffer.from(queryEmbedding.buffer), maxDistance, ...f.params, limit) as Row[];
+    for (const row of rows) {
+      const seen = best.get(row.id);
+      if (!seen || row.distance < seen.distance) best.set(row.id, row);
+    }
+  }
+  const rows = [...best.values()].sort((a, b) => a.distance - b.distance).slice(0, limit);
   return rows.map((row) => ({
     chunkId: row.id,
     snippet: (row.user_content + ' ' + row.assistant_content).slice(0, 100),
