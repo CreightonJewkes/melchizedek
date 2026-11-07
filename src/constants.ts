@@ -29,6 +29,8 @@ export interface ModelSpec {
   documentPrefix?: string;
   /** Preferred dtype in order of attempt — first success wins */
   dtypePreference: Array<'q8' | 'fp16' | 'fp32'>;
+  /** Embed prompt and reply apart (src/windows.ts); part of the recipe. Set from config, not the registry. */
+  splitWindows?: boolean;
 }
 
 export const MODEL_REGISTRY: Record<string, ModelSpec> = {

@@ -108,6 +108,8 @@ export interface Embedder {
    * pooling, input cap, dtype). Stored beside the model ID; a change means a re-embed.
    */
   recipe?(): string;
+  /** True when prompt and reply are embedded apart (src/windows.ts). */
+  splitWindows?(): boolean;
 }
 
 // --- Reranker ---
@@ -141,6 +143,8 @@ export interface MelchizedekConfig {
   embeddingsEnabled: boolean;
   embeddingTextBackend: EmbeddingBackend;
   embeddingTextModel: string | null;
+  /** Embed prompt and reply apart (src/windows.ts); a recipe change, so it re-embeds. Off by default. */
+  embeddingTextWindows: boolean;
   embeddingCodeBackend: EmbeddingBackend;
   embeddingCodeModel: string | null;
   embeddingCodeEnabled: boolean;
@@ -219,6 +223,8 @@ export interface WorkerStartMessage {
     embeddingBackend: EmbeddingBackend;
     embeddingModel: string | null;
     ollamaBaseUrl: string;
+    /** Text jobs only: split prompt/reply windows. */
+    splitWindows?: boolean;
   };
   batchSize: number;
   logLevel?: string;
@@ -252,6 +258,8 @@ export interface EmbedJobConfig {
     embeddingBackend: EmbeddingBackend;
     embeddingModel: string | null;
     ollamaBaseUrl: string;
+    /** Text jobs only: split prompt/reply windows. */
+    splitWindows?: boolean;
   };
   batchSize?: number;
   logLevel?: string;

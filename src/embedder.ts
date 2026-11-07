@@ -92,7 +92,13 @@ export class TransformersJsEmbedder implements Embedder {
       document: s.documentPrefix ?? '',
       input: s.maxInputChars,
       dtype: s.dtypePreference[0],
+      // Only present when on, so recipes stored before the option existed still match.
+      ...(s.splitWindows ? { windows: true } : {}),
     });
+  }
+
+  splitWindows(): boolean {
+    return !!this.spec.splitWindows;
   }
 
   dimensions(): number {
@@ -407,6 +413,8 @@ export interface TextEmbedderConfig {
   embeddingBackend?: EmbeddingBackend;
   embeddingModel?: string | null;
   ollamaBaseUrl?: string;
+  /** Split prompt/reply windows (src/windows.ts); transformers.js models only. */
+  windows?: boolean;
 }
 
 export interface CodeEmbedderConfig {
@@ -422,7 +430,8 @@ export async function createTextEmbedder(config?: TextEmbedderConfig): Promise<E
 
   if (backend === 'transformers-js' || backend === 'auto') {
     const modelKey = config?.embeddingModel ?? DEFAULT_TEXT_MODEL_KEY;
-    const spec = lookupModelSpec(modelKey);
+    const found = lookupModelSpec(modelKey);
+    const spec = found && config?.windows ? { ...found, splitWindows: true } : found;
     if (spec) {
       const embedder = await createTransformersJsEmbedder(spec);
       if (embedder) return embedder;

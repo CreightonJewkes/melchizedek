@@ -118,6 +118,7 @@ if (isMainModule) {
         embeddingBackend: cfg.embeddingTextBackend,
         embeddingModel: cfg.embeddingTextModel,
         ollamaBaseUrl: cfg.ollamaBaseUrl,
+        windows: cfg.embeddingTextWindows,
       });
       if (embedderText) {
         logMemory('after text embedder load');
@@ -322,6 +323,7 @@ if (isMainModule) {
         config: {
           embeddingTextBackend: cfg.embeddingTextBackend,
           embeddingTextModel: cfg.embeddingTextModel,
+          embeddingTextWindows: cfg.embeddingTextWindows,
           embeddingCodeBackend: cfg.embeddingCodeBackend,
           embeddingCodeModel: cfg.embeddingCodeModel,
           ollamaBaseUrl: cfg.ollamaBaseUrl,

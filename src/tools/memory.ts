@@ -30,6 +30,7 @@ const CONFIGURABLE_KEYS = new Set([
   'embeddingsEnabled',
   'embeddingTextBackend',
   'embeddingTextModel',
+  'embeddingTextWindows',
   'embeddingCodeBackend',
   'embeddingCodeModel',
   'embeddingCodeEnabled',
@@ -52,6 +53,7 @@ const RERANKER_HOT_RELOAD_KEYS = new Set(['rerankerBackend', 'rerankerUrl']);
 const RESTART_REQUIRED_KEYS = new Set([
   'embeddingTextBackend',
   'embeddingTextModel',
+  'embeddingTextWindows',
   'embeddingCodeBackend',
   'embeddingCodeModel',
 ]);

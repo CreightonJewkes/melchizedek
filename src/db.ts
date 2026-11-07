@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { logger } from './logger.js';
+import { baseSuffix, secondWindowSuffix } from './windows.js';
 
 export type { Database as DatabaseType } from 'better-sqlite3';
 
@@ -408,24 +409,36 @@ export function insertVectorsBatch(
  */
 export function publishVectors(
   db: Database.Database,
-  items: Array<{ chunkId: string; hash: string; embedding: Float32Array }>,
+  items: Array<{
+    chunkId: string;
+    hash: string;
+    embedding: Float32Array;
+    embedding2?: Float32Array;
+  }>,
   suffix = '_text',
 ): number {
   if (items.length === 0) return 0;
   const current = db.prepare('SELECT hash FROM conv_chunks WHERE id = ? AND deleted_at IS NULL');
-  const mapped = db.prepare(`SELECT 1 FROM conv_vec_map${suffix} WHERE chunk_id = ?`);
-  const insVec = db.prepare(`INSERT INTO conv_vec${suffix} (embedding) VALUES (?)`);
-  const insMap = db.prepare(
-    `INSERT INTO conv_vec_map${suffix} (vec_rowid, chunk_id) VALUES (?, ?)`,
-  );
+  const pair = (s: string) => ({
+    mapped: db.prepare(`SELECT 1 FROM conv_vec_map${s} WHERE chunk_id = ?`),
+    insVec: db.prepare(`INSERT INTO conv_vec${s} (embedding) VALUES (?)`),
+    insMap: db.prepare(`INSERT INTO conv_vec_map${s} (vec_rowid, chunk_id) VALUES (?, ?)`),
+  });
+  const first = pair(suffix);
+  // The reply window (split windows only) goes to the parallel pair in the same transaction.
+  const second = items.some((i) => i.embedding2) ? pair(secondWindowSuffix(suffix)) : null;
   return db
     .transaction(() => {
       let published = 0;
-      for (const { chunkId, hash, embedding } of items) {
+      for (const { chunkId, hash, embedding, embedding2 } of items) {
         const row = current.get(chunkId) as { hash: string } | undefined;
-        if (!row || row.hash !== hash || mapped.get(chunkId)) continue;
-        const vecRowid = insVec.run(Buffer.from(embedding.buffer)).lastInsertRowid;
-        insMap.run(vecRowid, chunkId);
+        if (!row || row.hash !== hash || first.mapped.get(chunkId)) continue;
+        const vecRowid = first.insVec.run(Buffer.from(embedding.buffer)).lastInsertRowid;
+        first.insMap.run(vecRowid, chunkId);
+        if (embedding2 && second && !second.mapped.get(chunkId)) {
+          const rowid2 = second.insVec.run(Buffer.from(embedding2.buffer)).lastInsertRowid;
+          second.insMap.run(rowid2, chunkId);
+        }
         published++;
       }
       return published;
@@ -612,7 +625,7 @@ export function sweepOrphanVectors(db: Database.Database, batch = 2_000): SweepR
   const result: SweepResult = { orphanVectors: 0, danglingMaps: 0, skipped: [] };
   if (!hasVec(db)) return result;
   for (const { map, vec } of vectorTables(db)) {
-    const base = vec.slice('conv_vec'.length).replace(/_next$/, '');
+    const base = baseSuffix(vec.slice('conv_vec'.length));
     if (getMeta(db, `migration_target_model${base}`) !== null) {
       result.skipped.push(vec);
       continue;
@@ -763,10 +776,11 @@ export function getChunksWithoutEmbeddings(
   db: Database.Database,
   limit = 100,
   suffix = '_text',
-): Array<{ id: string; content: string; hash: string }> {
+): Array<{ id: string; content: string; hash: string; user: string; assistant: string }> {
   return db
     .prepare(
-      `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash
+      `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash,
+              c.user_content AS user, c.assistant_content AS assistant
        FROM conv_chunks c
        LEFT JOIN conv_vec_map${suffix} m ON c.id = m.chunk_id
        WHERE m.chunk_id IS NULL
@@ -775,7 +789,13 @@ export function getChunksWithoutEmbeddings(
        ORDER BY c.timestamp DESC
        LIMIT ?`,
     )
-    .all(MIN_EMBED_CONTENT_LENGTH, limit) as Array<{ id: string; content: string; hash: string }>;
+    .all(MIN_EMBED_CONTENT_LENGTH, limit) as Array<{
+    id: string;
+    content: string;
+    hash: string;
+    user: string;
+    assistant: string;
+  }>;
 }
 
 const PENDING_SQL = (suffix: string) => `

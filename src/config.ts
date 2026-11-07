@@ -60,6 +60,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
     embeddingsEnabled: true,
     embeddingTextBackend: 'auto',
     embeddingTextModel: null,
+    embeddingTextWindows: false,
     embeddingCodeBackend: 'auto',
     embeddingCodeModel: null,
     embeddingCodeEnabled: true,
@@ -86,6 +87,7 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
       .M9K_EMBEDDING_TEXT_BACKEND as MelchizedekConfig['embeddingTextBackend'];
   if (process.env.M9K_EMBEDDING_TEXT_MODEL)
     env.embeddingTextModel = process.env.M9K_EMBEDDING_TEXT_MODEL;
+  if (process.env.M9K_EMBEDDING_TEXT_WINDOWS === 'true') env.embeddingTextWindows = true;
   if (process.env.M9K_EMBEDDING_CODE_BACKEND)
     env.embeddingCodeBackend = process.env
       .M9K_EMBEDDING_CODE_BACKEND as MelchizedekConfig['embeddingCodeBackend'];

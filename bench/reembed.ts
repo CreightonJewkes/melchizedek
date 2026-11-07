@@ -3,7 +3,9 @@
  * same calls the embed worker makes (seed meta, resume or detect the model change, embed into
  * the next generation, transactional swap) — so it doubles as a rehearsal of a live switch.
  *
- * Usage: tsx bench/reembed.ts --db <copy.db> --model <registry key> [--batch 50]
+ * Usage: tsx bench/reembed.ts --db <copy.db> --model <registry key> [--batch 50] [--windows]
+ *
+ * --windows re-embeds with split prompt/reply windows (src/windows.ts), a recipe change.
  *
  * Model files are read from M9K_MODEL_CACHE when set; remote downloads stay off. Set
  * M9K_ONNX_THREADS to cap inference threads, as the daemon's worker does. Never point it at a
@@ -43,6 +45,7 @@ if (!vecEnabled) throw new Error('sqlite-vec not available');
 const embedder = await createTextEmbedder({
   embeddingBackend: 'transformers-js',
   embeddingModel: model,
+  windows: process.argv.includes('--windows'),
 });
 if (!embedder) throw new Error(`model ${model} not available`);
 

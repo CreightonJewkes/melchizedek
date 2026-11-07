@@ -252,6 +252,7 @@ export class EmbedOrchestrator {
     config: {
       embeddingTextBackend: string;
       embeddingTextModel: string | null;
+      embeddingTextWindows?: boolean;
       embeddingCodeBackend: string;
       embeddingCodeModel: string | null;
       ollamaBaseUrl: string;
@@ -272,6 +273,7 @@ export class EmbedOrchestrator {
             | 'ollama',
           embeddingModel: opts.config.embeddingTextModel,
           ollamaBaseUrl: opts.config.ollamaBaseUrl,
+          splitWindows: opts.config.embeddingTextWindows,
         },
         logLevel: opts.logLevel,
       });

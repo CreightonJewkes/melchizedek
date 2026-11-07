@@ -19,6 +19,7 @@ import {
   MIN_EMBED_CONTENT_LENGTH,
 } from './db.js';
 import { logger } from './logger.js';
+import { embedChunkWindows, secondWindowSuffix } from './windows.js';
 
 const P = 'migration';
 
@@ -226,6 +227,9 @@ export class EmbeddingMigration {
     const targetDimensions = this.embedder.dimensions();
 
     createVecTables(this.db, targetDimensions, `${this.suffix}_next`);
+    if (this.embedder.splitWindows?.()) {
+      createVecTables(this.db, targetDimensions, secondWindowSuffix(`${this.suffix}_next`));
+    }
 
     setMeta(this.db, `migration_target_model${this.suffix}`, targetModel);
     setMeta(this.db, `migration_target_dimensions${this.suffix}`, String(targetDimensions));
@@ -283,7 +287,7 @@ export class EmbeddingMigration {
 
   /** Embed a single batch into _next tables */
   async reembedBatch(
-    batch?: Array<{ id: string; content: string; hash: string }>,
+    batch?: Array<{ id: string; content: string; hash: string; user: string; assistant: string }>,
   ): Promise<number> {
     const items = batch ?? this.getNextBatch();
     if (items.length === 0) return 0;
@@ -297,13 +301,9 @@ export class EmbeddingMigration {
       P,
       `reembedBatch${this.suffix}: ${texts.length} texts, len min=${minLen} max=${maxLen} avg=${avgLen}`,
     );
-    const embeddings = await this.embedder.embedBatch(texts);
+    const embeddings = await embedChunkWindows(this.embedder, items);
 
-    const vectorItems = items.map((c, i) => ({
-      chunkId: c.id,
-      hash: c.hash,
-      embedding: embeddings[i],
-    }));
+    const vectorItems = items.map((c, i) => ({ chunkId: c.id, hash: c.hash, ...embeddings[i] }));
 
     // Stale items (changed or deleted during inference) are discarded and re-read.
     return publishVectors(this.db, vectorItems, `${this.suffix}_next`);
@@ -322,11 +322,21 @@ export class EmbeddingMigration {
     const targetRecipe =
       getMeta(this.db, `migration_target_recipe${s}`) ?? embedderRecipe(this.embedder);
 
+    const w2 = secondWindowSuffix(s);
+    const w2Next = secondWindowSuffix(`${s}_next`);
+    const nextHasW2 = !!this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(`conv_vec_map${w2Next}`);
+
     this.db
       .transaction(() => {
+        // The second-window pair belongs to the old recipe: replaced, or dropped when the
+        // new one has no windows.
         this.db.exec(`
           DROP TABLE IF EXISTS conv_vec_map${s};
           DROP TABLE IF EXISTS conv_vec${s};
+          DROP TABLE IF EXISTS conv_vec_map${w2};
+          DROP TABLE IF EXISTS conv_vec${w2};
         `);
 
         // CRITICAL: sqlite-vec virtual tables cannot be safely renamed with
@@ -344,9 +354,22 @@ export class EmbeddingMigration {
             SELECT vec_rowid, chunk_id FROM conv_vec_map${s}_next;
         `);
 
+        if (nextHasW2) {
+          createVecTables(this.db, targetDimensions, w2);
+          this.db.exec(`
+            INSERT INTO conv_vec${w2}(rowid, embedding)
+              SELECT v.rowid, v.embedding FROM conv_vec_map${w2Next} m
+              JOIN conv_vec${w2Next} v ON v.rowid = m.vec_rowid;
+            INSERT INTO conv_vec_map${w2}(vec_rowid, chunk_id)
+              SELECT vec_rowid, chunk_id FROM conv_vec_map${w2Next};
+          `);
+        }
+
         this.db.exec(`
           DROP TABLE IF EXISTS conv_vec_map${s}_next;
           DROP TABLE IF EXISTS conv_vec${s}_next;
+          DROP TABLE IF EXISTS conv_vec_map${w2Next};
+          DROP TABLE IF EXISTS conv_vec${w2Next};
         `);
 
         setMeta(this.db, `embedding_model_id${s}`, targetModel);
@@ -354,6 +377,7 @@ export class EmbeddingMigration {
         setMeta(this.db, `embedding_recipe${s}`, targetRecipe);
         // The rebuilt table has no dead slots.
         deleteMeta(this.db, `vec_dead_rows:conv_vec${s}`);
+        deleteMeta(this.db, `vec_dead_rows:conv_vec${w2}`);
         this.cleanupMigrationMeta();
       })
       .immediate();
@@ -362,9 +386,12 @@ export class EmbeddingMigration {
   /** Abort: drop _next tables, clean up meta */
   abort(): void {
     try {
+      const w2Next = secondWindowSuffix(`${this.suffix}_next`);
       this.db.exec(`
         DROP TABLE IF EXISTS conv_vec_map${this.suffix}_next;
         DROP TABLE IF EXISTS conv_vec${this.suffix}_next;
+        DROP TABLE IF EXISTS conv_vec_map${w2Next};
+        DROP TABLE IF EXISTS conv_vec${w2Next};
       `);
     } catch (err) {
       // sqlite-vec virtual tables can fail to DROP — don't let that block meta cleanup
@@ -380,6 +407,7 @@ export class EmbeddingMigration {
     deleteMeta(this.db, `migration_progress${this.suffix}`);
     deleteMeta(this.db, `migration_started_at${this.suffix}`);
     deleteMeta(this.db, `vec_dead_rows:conv_vec${this.suffix}_next`);
+    deleteMeta(this.db, `vec_dead_rows:conv_vec${secondWindowSuffix(`${this.suffix}_next`)}`);
   }
 
   /** Full lifecycle: prepare → reembed → swap | abort */
@@ -466,10 +494,17 @@ export class EmbeddingMigration {
   }
 
   /** Get next batch of chunks not yet in _next tables */
-  private getNextBatch(): Array<{ id: string; content: string; hash: string }> {
+  private getNextBatch(): Array<{
+    id: string;
+    content: string;
+    hash: string;
+    user: string;
+    assistant: string;
+  }> {
     return this.db
       .prepare(
-        `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash
+        `SELECT c.id, (c.user_content || ' ' || c.assistant_content) AS content, c.hash,
+                c.user_content AS user, c.assistant_content AS assistant
          FROM conv_chunks c
          LEFT JOIN conv_vec_map${this.suffix}_next m ON c.id = m.chunk_id
          WHERE m.chunk_id IS NULL
@@ -482,6 +517,8 @@ export class EmbeddingMigration {
       id: string;
       content: string;
       hash: string;
+      user: string;
+      assistant: string;
     }>;
   }
 }

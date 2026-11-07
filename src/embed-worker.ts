@@ -115,16 +115,19 @@ process.on('message', async (msg: WorkerInMessage) => {
     }
 
     // Create the appropriate embedder
-    const createFn = msg.embedderType === 'text' ? createTextEmbedder : createCodeEmbedder;
     logger.debug(
       P,
       `Creating ${msg.embedderType} embedder (backend=${msg.config.embeddingBackend}, model=${msg.config.embeddingModel})`,
     );
-    const embedder = await createFn({
+    const embedderConfig = {
       embeddingBackend: msg.config.embeddingBackend,
       embeddingModel: msg.config.embeddingModel,
       ollamaBaseUrl: msg.config.ollamaBaseUrl,
-    });
+    };
+    const embedder =
+      msg.embedderType === 'text'
+        ? await createTextEmbedder({ ...embedderConfig, windows: msg.config.splitWindows })
+        : await createCodeEmbedder(embedderConfig);
 
     if (!embedder) {
       send({ type: 'error', message: `${msg.embedderType} embedder not available`, fatal: true });

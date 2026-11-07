@@ -15,6 +15,7 @@ import type {
   OrphanDetectionResult,
 } from './models.js';
 import {
+  createVecTables,
   deleteChunksWhere,
   deleteSessionsWhere,
   getChunksWithoutEmbeddings,
@@ -23,6 +24,7 @@ import {
   publishVectors,
 } from './db.js';
 import { logger } from './logger.js';
+import { embedChunkWindows, secondWindowSuffix } from './windows.js';
 import { CONV_KIND_EXCHANGE } from './constants.js';
 
 export function parseJSONL(content: string): JnlMessage[] {
@@ -501,6 +503,11 @@ export async function embedChunks(
       .get(MIN_EMBED_CONTENT_LENGTH) as { cnt: number }
   ).cnt;
 
+  // Split windows: the reply vectors go to a parallel pair, created on first use.
+  if (embedder.splitWindows?.()) {
+    createVecTables(db, embedder.dimensions(), secondWindowSuffix(suffix));
+  }
+
   // Process first batch
   let missing = firstBatch;
   let previousIds = '';
@@ -526,9 +533,9 @@ export async function embedChunks(
       `embedChunks${suffix}: batch=${texts.length}, len min=${minLen} max=${maxLen} avg=${avgLen}`,
     );
 
-    let embeddings: Float32Array[];
+    let embeddings: Array<{ embedding: Float32Array; embedding2?: Float32Array }>;
     try {
-      embeddings = await embedder.embedBatch(texts);
+      embeddings = await embedChunkWindows(embedder, missing);
     } catch (err) {
       logger.error(
         'indexer',
@@ -540,11 +547,7 @@ export async function embedChunks(
 
     if (signal?.aborted) break;
 
-    const items = missing.map((c, i) => ({
-      chunkId: c.id,
-      hash: c.hash,
-      embedding: embeddings[i],
-    }));
+    const items = missing.map((c, i) => ({ chunkId: c.id, hash: c.hash, ...embeddings[i] }));
 
     // Only committed vectors count; stale items are re-read on the next pass.
     const published = publishVectors(db, items, suffix);
