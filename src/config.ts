@@ -106,6 +106,8 @@ export function getConfig(overrides: Partial<MelchizedekConfig> = {}): Melchized
   if (process.env.M9K_LOG_LEVEL)
     env.logLevel = process.env.M9K_LOG_LEVEL as MelchizedekConfig['logLevel'];
   if (process.env.M9K_SEARCH_LOG === 'true') env.searchLog = true;
+  if (process.env.M9K_CANDIDATE_DEPTH)
+    env.candidateDepth = parseInt(process.env.M9K_CANDIDATE_DEPTH, 10);
 
   // Merge: defaults < config.json < env vars < overrides
   return { ...defaults, ...file, ...env, ...overrides };

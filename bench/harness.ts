@@ -5,6 +5,7 @@
  * Usage:
  *   tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir> [--set main|hard|errors|files]
  *                        [--model <registry key>] [--no-rerank] [--limit 10] [--max-per-session N]
+ *                        [--depth N]   (minimum candidates per channel; unset keeps limit × 2)
  *
  * Model files are read from M9K_MODEL_CACHE (a transformers.js cache dir) when set; remote downloads
  * stay off. Boosts are neutral (no currentProject / currentSession). Nothing here writes to the DB
@@ -54,6 +55,8 @@ const set = arg('set', 'main')!;
 const modelKey = arg('model', DEFAULT_TEXT_MODEL_KEY)!;
 const LIMIT = parseInt(arg('limit', '10')!, 10);
 const MAX_PER_SESSION = arg('max-per-session') ? parseInt(arg('max-per-session')!, 10) : undefined;
+const DEPTH_ARG = arg('depth') ? parseInt(arg('depth')!, 10) : undefined;
+const DEPTH = S.channelDepth(LIMIT, DEPTH_ARG);
 if (!dbPath || !queriesPath || !outDir) {
   console.error('usage: tsx bench/harness.ts --db <copy.db> --queries <set.jsonl> --out <dir>');
   process.exit(2);
@@ -112,7 +115,11 @@ function toolHandlers(ctx: SearchContext): Record<string, (a: unknown) => Promis
       tools[name] = handler;
     },
   };
-  const toolCtx = { db, searchContext: ctx } as unknown as ToolContext;
+  const toolCtx = {
+    db,
+    searchContext: ctx,
+    cfg: { candidateDepth: DEPTH_ARG },
+  } as unknown as ToolContext;
   registerSpecializedTools(fake as never, toolCtx);
   return tools;
 }
@@ -175,13 +182,19 @@ async function main(): Promise<void> {
     if (set !== 'files') {
       const emb = await (embedder.embedQuery ?? embedder.embed).call(embedder, q.query);
       const expr = S.buildFtsQuery ? S.buildFtsQuery(q.query) : q.query;
-      const bm25raw = S.searchBM25(db, expr, LIMIT * 2);
-      const vecraw = S.searchVectorized(db, emb, LIMIT * 2);
-      const fuzzyraw = S.searchFuzzy(db, q.query, LIMIT * 2);
+      const bm25raw = S.searchBM25(db, expr, DEPTH);
+      const vecraw = S.searchVectorized(db, emb, DEPTH);
+      const fuzzyraw = S.searchFuzzy(db, q.query, DEPTH);
       runs.bm25 = ids(applyFilters(bm25raw, o)).slice(0, LIMIT);
       runs.vector = ids(applyFilters(vecraw, o)).slice(0, LIMIT);
       runs.fuzzy = ids(applyFilters(fuzzyraw, o)).slice(0, LIMIT);
-      const opts = { query: q.query, limit: LIMIT, ...o, maxPerSession: MAX_PER_SESSION };
+      const opts = {
+        query: q.query,
+        limit: LIMIT,
+        ...o,
+        maxPerSession: MAX_PER_SESSION,
+        candidateDepth: DEPTH_ARG,
+      };
       runs.full_norerank = ids(await S.search(db, opts, baseCtx));
       const t0 = performance.now();
       const full = await S.search(db, opts, fullCtx);
@@ -212,6 +225,7 @@ async function main(): Promise<void> {
     set,
     model: modelKey,
     rerank: !!reranker,
+    depth: DEPTH,
     n: queries.length,
     p50_ms: +pct(0.5).toFixed(1),
     p95_ms: +pct(0.95).toFixed(1),

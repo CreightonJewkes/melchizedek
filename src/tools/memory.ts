@@ -42,6 +42,7 @@ const CONFIGURABLE_KEYS = new Set([
   'autoFuzzyThreshold',
   'projectBoost',
   'logLevel',
+  'candidateDepth',
 ]);
 
 // Keys that trigger a hot-reload of the reranker when changed

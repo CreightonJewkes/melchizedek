@@ -74,6 +74,11 @@ export interface SearchOptions {
   projectBoost?: number;
   /** Keep at most this many results per session, refilling from lower ranks (off when unset). */
   maxPerSession?: number;
+  /**
+   * Minimum candidates each channel (keywords, text and code vectors, prefix fallback) fetches
+   * before fusion. Unset keeps limit × 2; a larger value only ever deepens the pull.
+   */
+  candidateDepth?: number;
 }
 
 // --- Search context ---
@@ -155,6 +160,8 @@ export interface MelchizedekConfig {
   logLevel: LogLevel;
   /** Log every tool call locally to ~/.melchizedek/logs/search.jsonl (src/search-log.ts). Off by default. */
   searchLog: boolean;
+  /** Minimum candidates per search channel (SearchOptions.candidateDepth). Unset: limit × 2. */
+  candidateDepth?: number;
 }
 
 export interface OrphanDetectionResult {

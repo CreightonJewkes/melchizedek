@@ -367,6 +367,22 @@ function capPerSession(results: SearchResult[], max?: number): SearchResult[] {
 /** Fused candidates the cross-encoder scores per search (serially, in q8), whatever the limit. */
 export const RERANK_POOL = 20;
 
+/** Upper bound on a configured per-channel candidate depth. */
+export const MAX_CANDIDATE_DEPTH = 200;
+
+/**
+ * Candidates each channel fetches before fusion: limit × 2, or the configured minimum depth
+ * when that is larger (a deeper pull lets an answer found by two channels at middling ranks
+ * fuse above one found by a single channel). A non-numeric depth is ignored.
+ */
+export function channelDepth(limit: number, minDepth?: number): number {
+  const floor =
+    typeof minDepth === 'number' && Number.isFinite(minDepth)
+      ? Math.min(Math.floor(minDepth), MAX_CANDIDATE_DEPTH)
+      : 0;
+  return Math.max(limit * 2, floor);
+}
+
 /** Score for position i of a final ranking, on the same scale as one RRF channel. */
 function rankScore(i: number): number {
   return 1 / (RRF_K + i + 1);
@@ -389,8 +405,10 @@ export async function search(
     until: options.until,
   };
 
+  const depth = channelDepth(options.limit, options.candidateDepth);
+
   // BM25 search (always available)
-  const bm25Results = searchBM25(db, buildFtsQuery(options.query), options.limit * 2, filters);
+  const bm25Results = searchBM25(db, buildFtsQuery(options.query), depth, filters);
   const t1 = performance.now();
   logger.debug('search', ` BM25: ${(t1 - t0).toFixed(0)}ms (${bm25Results.length} results)`);
   recordStage('bm25', t1 - t0);
@@ -414,9 +432,7 @@ export async function search(
       const t3 = performance.now();
       logger.debug('search', ` text embed: ${(t3 - t2).toFixed(0)}ms`);
       recordStage('text_embed', t3 - t2);
-      vecLists.push(
-        searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_text', filters),
-      );
+      vecLists.push(searchVectorized(db, emb, depth, MAX_VECTOR_DISTANCE, '_text', filters));
       logger.debug('search', ` text vec search: ${(performance.now() - t3).toFixed(0)}ms`);
       recordStage('text_vec', performance.now() - t3);
     } catch (err) {
@@ -436,9 +452,7 @@ export async function search(
       const t5 = performance.now();
       logger.debug('search', ` code embed: ${(t5 - t4).toFixed(0)}ms`);
       recordStage('code_embed', t5 - t4);
-      vecLists.push(
-        searchVectorized(db, emb, options.limit * 2, MAX_VECTOR_DISTANCE, '_code', filters),
-      );
+      vecLists.push(searchVectorized(db, emb, depth, MAX_VECTOR_DISTANCE, '_code', filters));
       logger.debug('search', ` code vec search: ${(performance.now() - t5).toFixed(0)}ms`);
       recordStage('code_vec', performance.now() - t5);
     } catch (err) {
@@ -452,7 +466,7 @@ export async function search(
 
   // Auto-fuzzy fallback: too few results -> prefix search, fused as its own channel
   if (results.length < autoFuzzyThreshold) {
-    const fuzzyResults = searchFuzzy(db, options.query, options.limit * 2, filters);
+    const fuzzyResults = searchFuzzy(db, options.query, depth, filters);
     if (fuzzyResults.length > 0) {
       // Prefix matches re-rank, but don't relabel what the other channels already found.
       const types = new Map(fusionRRF(vecLists).map((r) => [r.chunkId, r.matchType]));

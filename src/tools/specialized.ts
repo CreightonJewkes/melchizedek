@@ -57,7 +57,7 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       // error strings worse than fusion does (top-5 session hits 18 of 25 without it, 15 with).
       const results = await search(
         ctx.db,
-        { query: errorMessage, limit: limit * 3 },
+        { query: errorMessage, limit: limit * 3, candidateDepth: ctx.cfg.candidateDepth },
         { ...ctx.searchContext, reranker: null },
       );
 
@@ -142,7 +142,13 @@ export function registerSpecializedTools(server: McpServer, ctx: ToolContext): v
       // Use the same search pipeline as m9k_search
       const results = await search(
         ctx.db,
-        { query: description, limit: limit * 3, since: range.since, until: range.until },
+        {
+          query: description,
+          limit: limit * 3,
+          since: range.since,
+          until: range.until,
+          candidateDepth: ctx.cfg.candidateDepth,
+        },
         ctx.searchContext,
       );
 

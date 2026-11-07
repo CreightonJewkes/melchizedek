@@ -68,6 +68,7 @@ export function registerSearchTools(server: McpServer, ctx: ToolContext): void {
           currentProject: ctx.currentProject,
           currentSession: ctx.currentSession,
           projectBoost: ctx.cfg.projectBoost,
+          candidateDepth: ctx.cfg.candidateDepth,
           limit,
           since: range.since,
           until: range.until,
